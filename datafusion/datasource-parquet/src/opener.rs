@@ -29,6 +29,7 @@ use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
+use parquet::arrow::data_cache::DataCache;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -107,6 +108,8 @@ pub(super) struct ParquetOpener {
     /// Optional parquet FileDecryptionProperties
     #[cfg(feature = "parquet_encryption")]
     pub file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
+    /// E6 data cache
+    pub data_cache_opt: Option<Arc<DataCache>>,
     /// Rewrite expressions in the context of the file schema
     pub(crate) expr_adapter_factory: Arc<dyn PhysicalExprAdapterFactory>,
     /// Optional factory to create file decryption properties dynamically
@@ -274,6 +277,7 @@ impl FileOpener for ParquetOpener {
         let max_predicate_cache_size = self.max_predicate_cache_size;
 
         let reverse_row_groups = self.reverse_row_groups;
+        let data_cache_opt = self.data_cache_opt.clone();
         Ok(Box::pin(async move {
             #[cfg(feature = "parquet_encryption")]
             let file_decryption_properties = encryption_context
@@ -434,6 +438,10 @@ impl FileOpener for ParquetOpener {
             );
 
             let indices = projection.column_indices();
+            if let Some(data_cache) = data_cache_opt {
+                builder = builder.with_parquet_file_path(file_name.clone());
+                builder = builder.with_data_cache(data_cache);
+            }
 
             let mask = ProjectionMask::roots(builder.parquet_schema(), indices);
 
@@ -1148,6 +1156,7 @@ mod test {
                 encryption_factory: None,
                 max_predicate_cache_size: self.max_predicate_cache_size,
                 reverse_row_groups: self.reverse_row_groups,
+                data_cache_opt: None,
             }
         }
     }
