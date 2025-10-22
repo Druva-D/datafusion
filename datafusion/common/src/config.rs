@@ -457,6 +457,48 @@ impl From<SpillCompression> for Option<CompressionType> {
     }
 }
 
+impl FromStr for FilterEvaluationStrategy {
+    type Err = DataFusionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "e6" => Ok(Self::E6),
+            "datafusion" => Ok(Self::Datafusion),
+            other => Err(DataFusionError::Configuration(format!(
+                "Invalid filter evaluation strategy type: {other}. Expected one of: e6, datafusion"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum FilterEvaluationStrategy {
+    Datafusion,
+    #[default]
+    E6,
+}
+
+impl ConfigField for FilterEvaluationStrategy {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        v.some(key, self, description)
+    }
+
+    fn set(&mut self, _: &str, value: &str) -> Result<()> {
+        *self = FilterEvaluationStrategy::from_str(value)?;
+        Ok(())
+    }
+}
+
+impl Display for FilterEvaluationStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let str = match self {
+            Self::E6 => "e6",
+            Self::Datafusion => "datafusion",
+        };
+        write!(f, "{str}")
+    }
+}
+
 config_namespace! {
     /// Options related to query execution
     ///
@@ -650,6 +692,8 @@ config_namespace! {
         /// # Default
         /// `false` — ANSI SQL mode is disabled by default.
         pub enable_ansi_mode: bool, default = false
+        /// Filter evaulation strategy to use
+        pub filter_evaluation_strategy: FilterEvaluationStrategy, default = FilterEvaluationStrategy::E6
     }
 }
 

@@ -290,6 +290,8 @@ pub struct ParquetSource {
     pub(crate) projection: ProjectionExprs,
     /// E6 Data cache
     pub(crate) data_cache_opt: Option<Arc<DataCache>>,
+    /// Config options
+    pub(crate) config_options_opt: Option<Arc<ConfigOptions>>,
     #[cfg(feature = "parquet_encryption")]
     pub(crate) encryption_factory: Option<Arc<dyn EncryptionFactory>>,
     /// If true, read files in reverse order and reverse row groups within files.
@@ -323,6 +325,7 @@ impl ParquetSource {
             encryption_factory: None,
             reverse_row_groups: false,
             data_cache_opt: None,
+            config_options_opt: None,
         }
     }
 
@@ -569,6 +572,7 @@ impl FileSource for ParquetSource {
             file_decryption_properties,
             expr_adapter_factory,
             data_cache_opt: self.data_cache_opt.clone(),
+            config_options_opt: self.config_options_opt.clone(),
             #[cfg(feature = "parquet_encryption")]
             encryption_factory: self.get_encryption_factory_with_config(),
             max_predicate_cache_size: self.max_predicate_cache_size(),
@@ -826,6 +830,10 @@ impl FileSource for ParquetSource {
 impl ParquetSource {
     pub fn with_data_cache(&mut self, data_cache: Arc<DataCache>) {
         self.data_cache_opt = Some(data_cache);
+    }
+
+    pub fn with_config_options(&mut self, cfg_opts: Arc<ConfigOptions>) {
+        self.config_options_opt = Some(cfg_opts);
     }
 }
 

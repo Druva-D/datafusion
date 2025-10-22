@@ -19,14 +19,18 @@
 
 use crate::deletion_vector::{DVWrappedStream, DeletionVectorHolder};
 use crate::page_filter::PagePruningAccessPlanFilter;
+use crate::row_filter::{self, FilterCandidateBuilder};
 use crate::row_group_filter::RowGroupAccessPlanFilter;
 use crate::{
     ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
-    apply_file_schema_type_coercions, coerce_int96_to_resolution, row_filter,
+    apply_file_schema_type_coercions, coerce_int96_to_resolution,
 };
-use arrow::array::{RecordBatch, RecordBatchOptions};
+use arrow::array::{BooleanArray, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field};
+use arrow::error::ArrowError;
+use datafusion_common::config::{ConfigOptions, FilterEvaluationStrategy};
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
+use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
@@ -63,7 +67,8 @@ use log::debug;
 use parquet::arrow::RowNumber;
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, RowSelectionPolicy,
+    ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter,
+    RowSelectionPolicy,
 };
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
@@ -112,6 +117,8 @@ pub(super) struct ParquetOpener {
     pub file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
     /// E6 data cache
     pub data_cache_opt: Option<Arc<DataCache>>,
+    /// Config options
+    pub config_options_opt: Option<Arc<ConfigOptions>>,
     /// Rewrite expressions in the context of the file schema
     pub(crate) expr_adapter_factory: Arc<dyn PhysicalExprAdapterFactory>,
     /// Optional factory to create file decryption properties dynamically
@@ -280,6 +287,7 @@ impl FileOpener for ParquetOpener {
 
         let reverse_row_groups = self.reverse_row_groups;
         let data_cache_opt = self.data_cache_opt.clone();
+        let cfg_opts_opt = self.config_options_opt.clone();
         Ok(Box::pin(async move {
             #[cfg(feature = "parquet_encryption")]
             let file_decryption_properties = encryption_context
@@ -462,25 +470,101 @@ impl FileOpener for ParquetOpener {
 
             // Filter pushdown: evaluate predicates during scan
             if let Some(predicate) = pushdown_filters.then_some(predicate).flatten() {
-                let row_filter = row_filter::build_row_filter(
-                    &predicate,
-                    &physical_file_schema,
-                    builder.metadata(),
-                    reorder_predicates,
-                    &file_metrics,
-                );
+                if let Some(cfg_opts) = cfg_opts_opt {
+                    match cfg_opts.execution.filter_evaluation_strategy {
+                        FilterEvaluationStrategy::Datafusion => {
+                            let row_filter = row_filter::build_row_filter(
+                                &predicate,
+                                &physical_file_schema,
+                                builder.metadata(),
+                                reorder_predicates,
+                                &file_metrics,
+                            );
 
-                match row_filter {
-                    Ok(Some(filter)) => {
-                        builder = builder.with_row_filter(filter);
+                            match row_filter {
+                                Ok(Some(filter)) => {
+                                    builder = builder.with_row_filter(filter);
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    debug!(
+                                        "Ignoring error building row filter for '{predicate:?}': {e}"
+                                    );
+                                }
+                            };
+                        }
+                        FilterEvaluationStrategy::E6 => {
+                            let candidate = FilterCandidateBuilder::new(
+                                Arc::clone(&predicate),
+                                Arc::clone(&physical_file_schema),
+                                // Arc::clone(&predicate_file_schema),
+                                // Arc::clone(&schema_adapter_factory),
+                            )
+                            .build(builder.metadata())?
+                            .unwrap();
+
+                            let mask = ProjectionMask::roots(
+                                builder.metadata().file_metadata().schema_descr(),
+                                candidate.projection,
+                            );
+
+                            let physical_expr = reassign_expr_columns(
+                                candidate.expr,
+                                &candidate.filter_schema,
+                            )?;
+
+                            let row_filter = RowFilter::new(vec![Box::new(
+                                ArrowPredicateFn::new(mask, move |batch| {
+                                    // let batch =
+                                    //     candidate.schema_mapper.map_batch(batch)?;
+
+                                    let batch_size = batch.num_rows();
+
+                                    let columnar_value =
+                                        physical_expr.evaluate(&batch).map_err(|e| {
+                                            ArrowError::ExternalError(Box::new(e))
+                                        })?;
+
+                                    let bool_arr = match columnar_value {
+                                        ColumnarValue::Array(array) => array
+                                            .as_any()
+                                            .downcast_ref::<BooleanArray>()
+                                            .ok_or(ArrowError::ComputeError(
+                                                "unable to construct boolean filter mask"
+                                                    .to_string(),
+                                            ))?
+                                            .clone(),
+                                        ColumnarValue::Scalar(scalar) => {
+                                            // This can happen in cases like:
+                                            // - shortcircuit in binary expressions
+
+                                            // UX is a bit weird, ideally we
+                                            // should not do this, but arrow's
+                                            // predicate function expects a boolarr
+                                            // and there are cases where evaluate
+                                            // can return Scalar value, so one
+                                            // would have to expand them manually
+
+                                            // This is exactly what we do here
+                                            match scalar {
+                                                ScalarValue::Boolean(bool_opt) => vec![
+                                                    bool_opt.unwrap_or(false);
+                                                    batch_size
+                                                ]
+                                                .into(),
+                                                _ => unreachable!(),
+                                            }
+                                        }
+                                    };
+
+                                    Ok(bool_arr)
+                                }),
+                            )]);
+
+                            builder = builder.with_row_filter(row_filter);
+                        }
                     }
-                    Ok(None) => {}
-                    Err(e) => {
-                        debug!(
-                            "Ignoring error building row filter for '{predicate:?}': {e}"
-                        );
-                    }
-                };
+                }
             };
             if force_filter_selections {
                 builder =
@@ -1208,6 +1292,7 @@ mod test {
                 max_predicate_cache_size: self.max_predicate_cache_size,
                 reverse_row_groups: self.reverse_row_groups,
                 data_cache_opt: None,
+                config_options_opt: None,
             }
         }
     }
