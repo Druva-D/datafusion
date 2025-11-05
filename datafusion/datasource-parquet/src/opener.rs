@@ -17,6 +17,7 @@
 
 //! [`ParquetOpener`] for opening Parquet files
 
+use crate::deletion_vector::{DVWrappedStream, DeletionVectorHolder};
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::row_group_filter::RowGroupAccessPlanFilter;
 use crate::{
@@ -24,7 +25,7 @@ use crate::{
     apply_file_schema_type_coercions, coerce_int96_to_resolution, row_filter,
 };
 use arrow::array::{RecordBatch, RecordBatchOptions};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::reassign_expr_columns;
@@ -59,6 +60,7 @@ use datafusion_common::config::EncryptionFactoryOptions;
 use datafusion_execution::parquet_encryption::EncryptionFactory;
 use futures::{Stream, StreamExt, TryStreamExt, ready};
 use log::debug;
+use parquet::arrow::RowNumber;
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, RowSelectionPolicy,
@@ -417,6 +419,19 @@ impl FileOpener for ParquetOpener {
                 &predicate_creation_errors,
             );
 
+            let deletion_vector_opt = partitioned_file.extensions.as_ref();
+            if deletion_vector_opt.is_some() {
+                let virtual_columns = vec![Arc::new(
+                    Field::new("row_number", DataType::Int64, false)
+                        .with_extension_type(RowNumber),
+                )];
+                options = options.with_virtual_columns(virtual_columns)?;
+                reader_metadata = ArrowReaderMetadata::try_new(
+                    Arc::clone(reader_metadata.metadata()),
+                    options.clone(),
+                )?;
+            }
+
             // The page index is not stored inline in the parquet footer so the
             // code above may not have read the page index structures yet. If we
             // need them for reading and they aren't yet loaded, we need to load them now.
@@ -578,6 +593,21 @@ impl FileOpener for ParquetOpener {
                 .with_metrics(arrow_reader_metrics.clone())
                 .build()?;
 
+            let stream_schema = Arc::clone(stream.schema());
+
+            let stream = stream.map_err(DataFusionError::from);
+
+            let stream = if let Some(deletion_vector) = deletion_vector_opt {
+                let deletion_vector = deletion_vector
+                    .downcast_ref::<Arc<DeletionVectorHolder>>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("DV missing in parquet".to_owned())
+                    })?;
+                DVWrappedStream::new(stream, Arc::clone(&deletion_vector)).boxed()
+            } else {
+                stream.boxed()
+            };
+
             let files_ranges_pruned_statistics =
                 file_metrics.files_ranges_pruned_statistics.clone();
             let predicate_cache_inner_records =
@@ -587,7 +617,6 @@ impl FileOpener for ParquetOpener {
             let data_cache_bytes_hit = file_metrics.data_cache_bytes_hit.clone();
             let data_cache_bytes_missed = file_metrics.data_cache_bytes_missed.clone();
 
-            let stream_schema = Arc::clone(stream.schema());
             // Check if we need to replace the schema to handle things like differing nullability or metadata.
             // See note below about file vs. output schema.
             let replace_schema = !stream_schema.eq(&output_schema);
@@ -600,7 +629,7 @@ impl FileOpener for ParquetOpener {
 
             let projector = projection.make_projector(&stream_schema)?;
 
-            let stream = stream.map_err(DataFusionError::from).map(move |b| {
+            let stream = stream.map(move |b| {
                 b.and_then(|mut b| {
                     copy_arrow_reader_metrics(
                         &arrow_reader_metrics,
@@ -1985,4 +2014,39 @@ mod test {
             "Reverse scan with non-contiguous row groups should correctly map RowSelection"
         );
     }
+
+    // TODO: Readd this test back
+    // #[tokio::test]
+    // async fn test_deletion_vectors() {
+    //     let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+
+    //     let batch = record_batch!(
+    //         ("a", Int32, vec![Some(1), Some(2), Some(2)]),
+    //         ("b", Float32, vec![Some(1.0), Some(2.0), None])
+    //     )
+    //     .unwrap();
+
+    //     let data_size =
+    //         write_parquet(Arc::clone(&store), "test.parquet", batch.clone()).await;
+
+    //     let schema = batch.schema();
+    //     let deletion_vector = DeletionVectorHolder::try_new(vec![]);
+    //     let file = PartitionedFile::new(
+    //         "test.parquet".to_string(),
+    //         u64::try_from(data_size).unwrap(),
+    //     )
+    //     .with_extensions(Arc::new(deletion_vector));
+
+    //     let opener = ParquetOpenerBuilder::new()
+    //         .with_store(Arc::clone(&store))
+    //         .with_schema(Arc::clone(&schema))
+    //         .with_projection_indices(&[0, 1])
+    //         .with_row_group_stats_pruning(true)
+    //         .build();
+
+    //     let stream = opener.open(file).unwrap().await.unwrap();
+    //     let (num_batches, num_rows) = count_batches_and_rows(stream).await;
+    //     assert_eq!(num_batches, 1);
+    //     // assert_eq!(num_rows, 1);
+    // }
 }

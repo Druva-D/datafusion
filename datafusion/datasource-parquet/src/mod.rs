@@ -22,6 +22,7 @@
 #![deny(clippy::allow_attributes)]
 
 pub mod access_plan;
+pub mod deletion_vector;
 pub mod file_format;
 pub mod metadata;
 mod metrics;
