@@ -16,6 +16,7 @@
 // under the License.
 
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType};
+use std::collections::HashSet;
 
 use crate::file_groups::FileGroup;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
@@ -27,23 +28,61 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 /// {NUM_GROUPS groups: [[file1, file2,...], [fileN, fileM, ...], ...]}
 /// ```
 #[derive(Debug)]
-pub(crate) struct FileGroupsDisplay<'a>(pub(crate) &'a [FileGroup]);
+#[allow(dead_code)]
+pub(crate) struct FileGroupsDisplay<'a> {
+    pub(crate) groups: &'a [FileGroup],
+    pub(crate) show_summary: bool,
+}
+
+impl<'a> FileGroupsDisplay<'a> {
+    pub fn new(groups: &'a [FileGroup], show_summary: bool) -> Self {
+        Self {
+            groups,
+            show_summary,
+        }
+    }
+}
 
 impl DisplayAs for FileGroupsDisplay<'_> {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> FmtResult {
-        let n_groups = self.0.len();
+        let n_groups = self.groups.len();
         let groups = if n_groups == 1 { "group" } else { "groups" };
         write!(f, "{{{n_groups} {groups}: [")?;
         match t {
-            DisplayFormatType::Default | DisplayFormatType::TreeRender => {
+            DisplayFormatType::Default => {
+                if self.show_summary {
+                    // Summary mode: show counts only
+                    let mut file_set = HashSet::new();
+                    let mut num_partitioned_files: usize = 0;
+                    for fg in self.groups {
+                        num_partitioned_files = num_partitioned_files + fg.len();
+                        for pf in fg.files() {
+                            file_set.insert(&pf.object_meta.location);
+                        }
+                    }
+                    write!(
+                        f,
+                        "num_files:{}, num_partitioned_files:{}",
+                        file_set.len(),
+                        num_partitioned_files
+                    )?;
+                } else {
+                    // Detailed mode: list files (up to max_groups)
+                    let max_groups = 5;
+                    fmt_up_to_n_elements(self.groups, max_groups, f, |group, f| {
+                        FileGroupDisplay(group).fmt_as(t, f)
+                    })?;
+                }
+            }
+            DisplayFormatType::TreeRender => {
                 // To avoid showing too many partitions
                 let max_groups = 5;
-                fmt_up_to_n_elements(self.0, max_groups, f, |group, f| {
+                fmt_up_to_n_elements(self.groups, max_groups, f, |group, f| {
                     FileGroupDisplay(group).fmt_as(t, f)
                 })?;
             }
             DisplayFormatType::Verbose => {
-                fmt_elements_split_by_commas(self.0.iter(), f, |group, f| {
+                fmt_elements_split_by_commas(self.groups.iter(), f, |group, f| {
                     FileGroupDisplay(group).fmt_as(t, f)
                 })?
             }
@@ -141,36 +180,83 @@ mod tests {
     use chrono::Utc;
 
     #[test]
-    fn file_groups_display_empty() {
-        let expected = "{0 groups: []}";
-        assert_eq!(DefaultDisplay(FileGroupsDisplay(&[])).to_string(), expected);
-    }
-
-    #[test]
-    fn file_groups_display_one() {
-        let files = [FileGroup::new(vec![
-            partitioned_file("foo"),
-            partitioned_file("bar"),
-        ])];
-
-        let expected = "{1 group: [[foo, bar]]}";
+    fn file_groups_display_empty_summary() {
+        // Summary mode (show_summary: true) - shows counts
+        let expected = "{0 groups: [num_files:0, num_partitioned_files:0]}";
         assert_eq!(
-            DefaultDisplay(FileGroupsDisplay(&files)).to_string(),
+            DefaultDisplay(FileGroupsDisplay::new(&[], true)).to_string(),
             expected
         );
     }
 
     #[test]
-    fn file_groups_display_many_default() {
+    fn file_groups_display_empty_detailed() {
+        // Detailed mode (show_summary: false) - shows file list
+        let expected = "{0 groups: []}";
+        assert_eq!(
+            DefaultDisplay(FileGroupsDisplay::new(&[], false)).to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn file_groups_display_one_summary() {
+        let files = [FileGroup::new(vec![
+            partitioned_file("foo"),
+            partitioned_file("bar"),
+        ])];
+
+        // Summary mode shows counts
+        let expected = "{1 group: [num_files:2, num_partitioned_files:2]}";
+        assert_eq!(
+            DefaultDisplay(FileGroupsDisplay::new(&files, true)).to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn file_groups_display_one_detailed() {
+        let files = [FileGroup::new(vec![
+            partitioned_file("foo"),
+            partitioned_file("bar"),
+        ])];
+
+        // Detailed mode shows file list
+        let expected = "{1 group: [[foo, bar]]}";
+        assert_eq!(
+            DefaultDisplay(FileGroupsDisplay::new(&files, false)).to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn file_groups_display_many_summary() {
         let files = [
             FileGroup::new(vec![partitioned_file("foo"), partitioned_file("bar")]),
             FileGroup::new(vec![partitioned_file("baz")]),
             FileGroup::default(),
         ];
 
+        // Summary mode shows counts (3 unique files, 3 partitioned files)
+        let expected = "{3 groups: [num_files:3, num_partitioned_files:3]}";
+        assert_eq!(
+            DefaultDisplay(FileGroupsDisplay::new(&files, true)).to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn file_groups_display_many_detailed() {
+        let files = [
+            FileGroup::new(vec![partitioned_file("foo"), partitioned_file("bar")]),
+            FileGroup::new(vec![partitioned_file("baz")]),
+            FileGroup::default(),
+        ];
+
+        // Detailed mode shows file list
         let expected = "{3 groups: [[foo, bar], [baz], []]}";
         assert_eq!(
-            DefaultDisplay(FileGroupsDisplay(&files)).to_string(),
+            DefaultDisplay(FileGroupsDisplay::new(&files, false)).to_string(),
             expected
         );
     }
@@ -183,15 +269,16 @@ mod tests {
             FileGroup::default(),
         ];
 
+        // Verbose mode always shows all files (show_summary ignored)
         let expected = "{3 groups: [[foo, bar], [baz], []]}";
         assert_eq!(
-            VerboseDisplay(FileGroupsDisplay(&files)).to_string(),
+            VerboseDisplay(FileGroupsDisplay::new(&files, true)).to_string(),
             expected
         );
     }
 
     #[test]
-    fn file_groups_display_too_many_default() {
+    fn file_groups_display_too_many_summary() {
         let files = [
             FileGroup::new(vec![partitioned_file("foo"), partitioned_file("bar")]),
             FileGroup::new(vec![partitioned_file("baz")]),
@@ -202,9 +289,30 @@ mod tests {
             FileGroup::default(),
         ];
 
+        // Summary mode shows counts (7 unique files: foo,bar,baz,qux,quux,quuux,quuuux)
+        let expected = "{7 groups: [num_files:7, num_partitioned_files:7]}";
+        assert_eq!(
+            DefaultDisplay(FileGroupsDisplay::new(&files, true)).to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn file_groups_display_too_many_detailed() {
+        let files = [
+            FileGroup::new(vec![partitioned_file("foo"), partitioned_file("bar")]),
+            FileGroup::new(vec![partitioned_file("baz")]),
+            FileGroup::new(vec![partitioned_file("qux")]),
+            FileGroup::new(vec![partitioned_file("quux")]),
+            FileGroup::new(vec![partitioned_file("quuux")]),
+            FileGroup::new(vec![partitioned_file("quuuux")]),
+            FileGroup::default(),
+        ];
+
+        // Detailed mode shows truncated list (max 5 groups)
         let expected = "{7 groups: [[foo, bar], [baz], [qux], [quux], [quuux], ...]}";
         assert_eq!(
-            DefaultDisplay(FileGroupsDisplay(&files)).to_string(),
+            DefaultDisplay(FileGroupsDisplay::new(&files, false)).to_string(),
             expected
         );
     }
@@ -221,10 +329,11 @@ mod tests {
             FileGroup::default(),
         ];
 
+        // Verbose mode shows all files
         let expected =
             "{7 groups: [[foo, bar], [baz], [qux], [quux], [quuux], [quuuux], []]}";
         assert_eq!(
-            VerboseDisplay(FileGroupsDisplay(&files)).to_string(),
+            VerboseDisplay(FileGroupsDisplay::new(&files, true)).to_string(),
             expected
         );
     }

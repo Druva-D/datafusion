@@ -1205,6 +1205,15 @@ config_namespace! {
         /// "summary" shows common metrics for high-level insights.
         /// "dev" provides deep operator-level introspection for developers.
         pub analyze_level: ExplainAnalyzeLevel, default = ExplainAnalyzeLevel::Dev
+
+        /// When set to true, the explain statement will print the table name
+        /// for DataSourceExec nodes. Set to false to hide table name.
+        pub show_datasource_table_name: bool, default = false
+
+        /// When set to true, the explain statement will print a summary of file
+        /// groups (count only) instead of listing individual files. Set to false
+        /// for detailed file listing.
+        pub show_file_groups_summary: bool, default = false
     }
 }
 

@@ -125,6 +125,12 @@ use std::{any::Any, fmt::Debug, fmt::Formatter, fmt::Result as FmtResult, sync::
 /// [`DataSourceExec::from_data_source`]: crate::source::DataSourceExec::from_data_source
 #[derive(Clone)]
 pub struct FileScanConfig {
+    /// Fully qualified table name
+    pub table_name: Option<String>,
+    /// Whether to show table name in display output (from ExplainOptions)
+    pub show_table_name: bool,
+    /// Whether to show file groups as summary (from ExplainOptions)
+    pub show_file_groups_summary: bool,
     /// Object store URL, used to get an [`ObjectStore`] instance from
     /// [`RuntimeEnv::object_store`]
     ///
@@ -237,6 +243,9 @@ pub struct FileScanConfig {
 /// ```
 #[derive(Clone)]
 pub struct FileScanConfigBuilder {
+    table_name: Option<String>,
+    show_table_name: bool,
+    show_file_groups_summary: bool,
     object_store_url: ObjectStoreUrl,
     file_source: Arc<dyn FileSource>,
     limit: Option<usize>,
@@ -262,6 +271,9 @@ impl FileScanConfigBuilder {
         file_source: Arc<dyn FileSource>,
     ) -> Self {
         Self {
+            table_name: None,
+            show_table_name: true,
+            show_file_groups_summary: true,
             object_store_url,
             file_source,
             file_groups: vec![],
@@ -274,6 +286,23 @@ impl FileScanConfigBuilder {
             expr_adapter_factory: None,
             partitioned_by_file_group: false,
         }
+    }
+
+    pub fn with_fully_qualified_table_name(mut self, table_name: String) -> Self {
+        self.table_name = Some(table_name);
+        self
+    }
+
+    /// Set whether to show table name in display output
+    pub fn with_show_table_name(mut self, show: bool) -> Self {
+        self.show_table_name = show;
+        self
+    }
+
+    /// Set whether to show file groups as summary
+    pub fn with_show_file_groups_summary(mut self, show: bool) -> Self {
+        self.show_file_groups_summary = show;
+        self
     }
 
     /// Set the maximum number of records to read from this plan. If `None`,
@@ -447,6 +476,9 @@ impl FileScanConfigBuilder {
     /// Returns an error if projection pushdown fails or if schema operations fail.
     pub fn build(self) -> FileScanConfig {
         let Self {
+            table_name,
+            show_table_name,
+            show_file_groups_summary,
             object_store_url,
             file_source,
             limit,
@@ -468,6 +500,9 @@ impl FileScanConfigBuilder {
             file_compression_type.unwrap_or(FileCompressionType::UNCOMPRESSED);
 
         FileScanConfig {
+            table_name,
+            show_table_name,
+            show_file_groups_summary,
             object_store_url,
             file_source,
             limit,
@@ -486,6 +521,9 @@ impl FileScanConfigBuilder {
 impl From<FileScanConfig> for FileScanConfigBuilder {
     fn from(config: FileScanConfig) -> Self {
         Self {
+            table_name: config.table_name,
+            show_table_name: config.show_table_name,
+            show_file_groups_summary: config.show_file_groups_summary,
             object_store_url: config.object_store_url,
             file_source: Arc::<dyn FileSource>::clone(&config.file_source),
             file_groups: config.file_groups,
@@ -530,8 +568,19 @@ impl DataSource for FileScanConfig {
                 let schema = self.projected_schema().map_err(|_| std::fmt::Error {})?;
                 let orderings = get_projected_output_ordering(self, &schema);
 
+                // Conditionally show table name
+                if self.show_table_name {
+                    write!(
+                        f,
+                        "table={}",
+                        self.table_name.as_ref().unwrap_or(&"Absent".to_string())
+                    )?;
+                    write!(f, ", ")?;
+                }
+
                 write!(f, "file_groups=")?;
-                FileGroupsDisplay(&self.file_groups).fmt_as(t, f)?;
+                FileGroupsDisplay::new(&self.file_groups, self.show_file_groups_summary)
+                    .fmt_as(t, f)?;
 
                 if !schema.fields().is_empty() {
                     if let Some(projection) = self.file_source.projection() {
@@ -1166,8 +1215,19 @@ impl DisplayAs for FileScanConfig {
         let schema = self.projected_schema().map_err(|_| std::fmt::Error {})?;
         let orderings = get_projected_output_ordering(self, &schema);
 
+        // Conditionally show table name
+        if self.show_table_name {
+            write!(
+                f,
+                "table={}",
+                self.table_name.as_ref().unwrap_or(&"Absent".to_string())
+            )?;
+            write!(f, ", ")?;
+        }
+
         write!(f, "file_groups=")?;
-        FileGroupsDisplay(&self.file_groups).fmt_as(t, f)?;
+        FileGroupsDisplay::new(&self.file_groups, self.show_file_groups_summary)
+            .fmt_as(t, f)?;
 
         if !schema.fields().is_empty() {
             write!(f, ", projection={}", ProjectSchemaDisplay(&schema))?;
