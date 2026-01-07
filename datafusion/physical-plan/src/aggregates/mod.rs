@@ -30,7 +30,7 @@ use crate::filter_pushdown::{
     ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
     FilterPushdownPropagation, PushedDownPredicate,
 };
-use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use crate::{
     DisplayFormatType, Distribution, ExecutionPlan, InputOrderMode,
     SendableRecordBatchStream, Statistics,
@@ -737,9 +737,16 @@ impl AggregateExec {
         partition: usize,
         context: &Arc<TaskContext>,
     ) -> Result<StreamType> {
+        // memory occupied by accumulator state
+        let accumulator_state_size =
+            MetricBuilder::new(&self.metrics).gauge("accumulator_state_size", partition);
+
         if self.group_by.is_true_no_grouping() {
             return Ok(StreamType::AggregateStream(AggregateStream::new(
-                self, context, partition,
+                self,
+                context,
+                partition,
+                accumulator_state_size,
             )?));
         }
 
@@ -754,7 +761,10 @@ impl AggregateExec {
 
         // grouping by something else and we need to just materialize all results
         Ok(StreamType::GroupedHash(GroupedHashAggregateStream::new(
-            self, context, partition,
+            self,
+            context,
+            partition,
+            accumulator_state_size,
         )?))
     }
 

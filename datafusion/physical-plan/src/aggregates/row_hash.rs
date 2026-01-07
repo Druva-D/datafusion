@@ -29,7 +29,7 @@ use crate::aggregates::{
     AggregateMode, PhysicalGroupBy, create_schema, evaluate_group_by, evaluate_many,
     evaluate_optional,
 };
-use crate::metrics::{BaselineMetrics, MetricBuilder, RecordOutput};
+use crate::metrics::{BaselineMetrics, Gauge, MetricBuilder, RecordOutput};
 use crate::sorts::sort::sort_batch;
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
 use crate::spill::spill_manager::SpillManager;
@@ -111,7 +111,7 @@ struct SpillState {
     // ========================================================================
     /// Peak memory used for buffered data.
     /// Calculated as sum of peak memory values across partitions
-    peak_mem_used: metrics::Gauge,
+    peak_mem_used: Gauge,
     // Metrics related to spilling are managed inside `spill_manager`
 }
 
@@ -446,6 +446,9 @@ pub(crate) struct GroupedHashAggregateStream {
     /// The behavior to trigger when out of memory occurs
     oom_mode: OutOfMemoryMode,
 
+    /// Accumulator
+    accumulator_state_size: Gauge,
+
     /// Execution metrics
     baseline_metrics: BaselineMetrics,
 
@@ -462,6 +465,7 @@ impl GroupedHashAggregateStream {
         agg: &AggregateExec,
         context: &Arc<TaskContext>,
         partition: usize,
+        accumulator_state_size: Gauge,
     ) -> Result<Self> {
         debug!("Creating GroupedHashAggregateStream");
         let agg_schema = Arc::clone(&agg.schema);
@@ -682,6 +686,7 @@ impl GroupedHashAggregateStream {
             group_values_soft_limit: agg.limit,
             skip_aggregation_probe,
             reduction_factor,
+            accumulator_state_size,
         })
     }
 }
@@ -890,6 +895,8 @@ impl Stream for GroupedHashAggregateStream {
                             self.group_values.len()
                         )));
                     }
+                    self.accumulator_state_size.add(self.reservation.size());
+
                     // release the memory reservation since sending back output batch itself needs
                     // some memory reservation, so make some room for it.
                     self.clear_all();

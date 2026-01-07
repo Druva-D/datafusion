@@ -48,7 +48,7 @@ use datafusion_physical_expr_common::physical_expr::{
     PhysicalExpr, is_dynamic_physical_expr,
 };
 use datafusion_physical_plan::metrics::{
-    Count, ExecutionPlanMetricsSet, MetricBuilder, PruningMetrics,
+    Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, PruningMetrics,
 };
 use datafusion_pruning::{FilePruner, PruningPredicate, build_pruning_predicate};
 
@@ -583,6 +583,9 @@ impl FileOpener for ParquetOpener {
             let predicate_cache_inner_records =
                 file_metrics.predicate_cache_inner_records.clone();
             let predicate_cache_records = file_metrics.predicate_cache_records.clone();
+            let max_memory_used = file_metrics.max_memory_used.clone();
+            let data_cache_bytes_hit = file_metrics.data_cache_bytes_hit.clone();
+            let data_cache_bytes_missed = file_metrics.data_cache_bytes_missed.clone();
 
             let stream_schema = Arc::clone(stream.schema());
             // Check if we need to replace the schema to handle things like differing nullability or metadata.
@@ -603,6 +606,9 @@ impl FileOpener for ParquetOpener {
                         &arrow_reader_metrics,
                         &predicate_cache_inner_records,
                         &predicate_cache_records,
+                        &max_memory_used,
+                        &data_cache_bytes_hit,
+                        &data_cache_bytes_missed,
                     );
                     b = projector.project_batch(&b)?;
                     if replace_schema {
@@ -649,6 +655,9 @@ fn copy_arrow_reader_metrics(
     arrow_reader_metrics: &ArrowReaderMetrics,
     predicate_cache_inner_records: &Count,
     predicate_cache_records: &Count,
+    max_memory_used: &Gauge,
+    data_cache_bytes_hit: &Count,
+    data_cache_bytes_missed: &Count,
 ) {
     if let Some(v) = arrow_reader_metrics.records_read_from_inner() {
         predicate_cache_inner_records.add(v);
@@ -656,6 +665,18 @@ fn copy_arrow_reader_metrics(
 
     if let Some(v) = arrow_reader_metrics.records_read_from_cache() {
         predicate_cache_records.add(v);
+    }
+
+    if let Some(v) = arrow_reader_metrics.total_memory_used() {
+        max_memory_used.set_max(v);
+    }
+
+    if let Some(v) = arrow_reader_metrics.data_cache_bytes_hit() {
+        data_cache_bytes_hit.add(v);
+    }
+
+    if let Some(v) = arrow_reader_metrics.data_cache_bytes_missed() {
+        data_cache_bytes_missed.add(v);
     }
 }
 
@@ -782,6 +803,7 @@ where
         if self.done {
             return Poll::Ready(None);
         }
+
         match ready!(self.inner.poll_next_unpin(cx)) {
             None => {
                 // input done
