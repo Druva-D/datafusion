@@ -1,0 +1,55 @@
+name: sqllite
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main, dev-*]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sqllite:
+    name: "Run sqllite tests"
+    runs-on: runs-on=${{ github.run_id }}/runner=32cpu-linux-arm64
+    container:
+      image: arm64v8/rust
+    defaults:
+      run:
+        working-directory: ./e6-datafusion
+    steps:
+      - name: Checkout e6-datafusion
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
+        with:
+          submodules: true
+          fetch-depth: 1
+          path: e6-datafusion
+      - name: Get e6-arrow-rs branch from e6-native-executor
+        id: get-arrow-branch
+        run: |
+          set -eo pipefail
+          ARROW_BRANCH=$(curl -fsS -H "Authorization: token ${{ secrets.E6_ARROW_RS_PAT }}" \
+            "https://raw.githubusercontent.com/e6data/e6-native-executor/main/.gitmodules" \
+            | grep -A3 '\[submodule "e6-arrow-rs"\]' | grep 'branch' | sed 's/.*= *//')
+          echo "branch=$ARROW_BRANCH" >> $GITHUB_OUTPUT
+        working-directory: .
+      - name: Checkout e6-arrow-rs
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
+        with:
+          repository: e6data/e6-arrow-rs
+          ref: ${{ steps.get-arrow-branch.outputs.branch }}
+          path: e6-arrow-rs
+          fetch-depth: 1
+          token: ${{ secrets.E6_ARROW_RS_PAT }}
+      - name: Setup Rust toolchain
+        uses: ./e6-datafusion/.github/actions/setup-builder
+        with:
+          rust-version: stable
+      - name: Run sqllite tests
+        run: |
+          export RUST_MIN_STACK=30485760
+          cargo test --features backtrace --profile release-nonlto --test sqllogictests --no-fail-fast -- --include-sqlite
