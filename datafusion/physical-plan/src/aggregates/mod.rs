@@ -22,8 +22,7 @@ use std::sync::Arc;
 
 use super::{DisplayAs, ExecutionPlanProperties, PlanProperties};
 use crate::aggregates::{
-    no_grouping::AggregateStream, row_hash::GroupedHashAggregateStream,
-    topk_stream::GroupedTopKAggregateStream,
+    no_grouping::AggregateStream, topk_stream::GroupedTopKAggregateStream,
 };
 use crate::execution_plan::{CardinalityEffect, EmissionType};
 use crate::filter_pushdown::{
@@ -38,6 +37,7 @@ use crate::{
 use datafusion_common::config::ConfigOptions;
 use datafusion_physical_expr::utils::collect_columns;
 use parking_lot::Mutex;
+pub use row_hash::GroupedHashAggregateStream;
 use std::collections::HashSet;
 
 use arrow::array::{ArrayRef, UInt8Array, UInt16Array, UInt32Array, UInt64Array};
@@ -391,7 +391,7 @@ impl PartialEq for PhysicalGroupBy {
 }
 
 #[expect(clippy::large_enum_variant)]
-enum StreamType {
+pub enum StreamType {
     AggregateStream(AggregateStream),
     GroupedHash(GroupedHashAggregateStream),
     GroupedPriorityQueue(GroupedTopKAggregateStream),
@@ -732,7 +732,7 @@ impl AggregateExec {
         self.limit
     }
 
-    fn execute_typed(
+    pub fn execute_typed(
         &self,
         partition: usize,
         context: &Arc<TaskContext>,
