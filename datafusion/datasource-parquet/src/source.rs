@@ -60,6 +60,8 @@ use object_store::ObjectStore;
 #[cfg(feature = "parquet_encryption")]
 use parquet::encryption::decrypt::FileDecryptionProperties;
 
+use parquet::arrow::data_cache::DataCache;
+
 /// Execution plan for reading one or more Parquet files.
 ///
 /// ```text
@@ -286,6 +288,10 @@ pub struct ParquetSource {
     pub(crate) metadata_size_hint: Option<usize>,
     /// Projection to apply to the output.
     pub(crate) projection: ProjectionExprs,
+    /// E6 Data cache
+    pub(crate) data_cache_opt: Option<Arc<DataCache>>,
+    /// Config options
+    pub(crate) config_options_opt: Option<Arc<ConfigOptions>>,
     #[cfg(feature = "parquet_encryption")]
     pub(crate) encryption_factory: Option<Arc<dyn EncryptionFactory>>,
     /// If true, read files in reverse order and reverse row groups within files.
@@ -318,6 +324,8 @@ impl ParquetSource {
             #[cfg(feature = "parquet_encryption")]
             encryption_factory: None,
             reverse_row_groups: false,
+            data_cache_opt: None,
+            config_options_opt: None,
         }
     }
 
@@ -563,6 +571,8 @@ impl FileSource for ParquetSource {
             #[cfg(feature = "parquet_encryption")]
             file_decryption_properties,
             expr_adapter_factory,
+            data_cache_opt: self.data_cache_opt.clone(),
+            config_options_opt: self.config_options_opt.clone(),
             #[cfg(feature = "parquet_encryption")]
             encryption_factory: self.get_encryption_factory_with_config(),
             max_predicate_cache_size: self.max_predicate_cache_size(),
@@ -814,6 +824,16 @@ impl FileSource for ParquetSource {
         // - File reordering based on min/max statistics
         // - Detection of exact ordering (return Exact to remove Sort operator)
         // - Partial sort pushdown for prefix matches
+    }
+}
+
+impl ParquetSource {
+    pub fn with_data_cache(&mut self, data_cache: Arc<DataCache>) {
+        self.data_cache_opt = Some(data_cache);
+    }
+
+    pub fn with_config_options(&mut self, cfg_opts: Arc<ConfigOptions>) {
+        self.config_options_opt = Some(cfg_opts);
     }
 }
 

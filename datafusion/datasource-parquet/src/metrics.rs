@@ -16,7 +16,7 @@
 // under the License.
 
 use datafusion_physical_plan::metrics::{
-    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricType, PruningMetrics,
+    Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricType, PruningMetrics,
     RatioMergeStrategy, RatioMetrics, Time,
 };
 
@@ -51,6 +51,8 @@ pub struct ParquetFileMetrics {
     pub row_groups_pruned_statistics: PruningMetrics,
     /// Total number of bytes scanned
     pub bytes_scanned: Count,
+    /// Max amount of memory used in this partition
+    pub max_memory_used: Gauge,
     /// Total rows filtered out by predicates pushed into parquet scan
     pub pushdown_rows_pruned: Count,
     /// Total rows passed predicates pushed into parquet scan
@@ -76,6 +78,10 @@ pub struct ParquetFileMetrics {
     /// number of rows that were stored in the cache after evaluating predicates
     /// reused for the output.
     pub predicate_cache_records: Count,
+    /// Data Cache: total bytes retrieved from cache (hits)
+    pub data_cache_bytes_hit: Count,
+    /// Data Cache: total bytes fetched from storage (misses)
+    pub data_cache_bytes_missed: Count,
 }
 
 impl ParquetFileMetrics {
@@ -107,6 +113,11 @@ impl ParquetFileMetrics {
             .with_new_label("filename", filename.to_string())
             .with_type(MetricType::SUMMARY)
             .counter("bytes_scanned", partition);
+
+        let max_memory_used = MetricBuilder::new(metrics)
+            .with_new_label("filename", filename.to_string())
+            .with_type(MetricType::SUMMARY)
+            .gauge("max_memory_used", partition);
 
         let metadata_load_time = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
@@ -162,12 +173,21 @@ impl ParquetFileMetrics {
             .with_new_label("filename", filename.to_string())
             .counter("predicate_cache_records", partition);
 
+        let data_cache_bytes_hit = MetricBuilder::new(metrics)
+            .with_new_label("filename", filename.to_string())
+            .counter("data_cache_bytes_hit", partition);
+
+        let data_cache_bytes_missed = MetricBuilder::new(metrics)
+            .with_new_label("filename", filename.to_string())
+            .counter("data_cache_bytes_missed", partition);
+
         Self {
             files_ranges_pruned_statistics,
             predicate_evaluation_errors,
             row_groups_pruned_bloom_filter,
             row_groups_pruned_statistics,
             bytes_scanned,
+            max_memory_used,
             pushdown_rows_pruned,
             pushdown_rows_matched,
             row_pushdown_eval_time,
@@ -179,6 +199,8 @@ impl ParquetFileMetrics {
             scan_efficiency_ratio,
             predicate_cache_inner_records,
             predicate_cache_records,
+            data_cache_bytes_hit,
+            data_cache_bytes_missed,
         }
     }
 }

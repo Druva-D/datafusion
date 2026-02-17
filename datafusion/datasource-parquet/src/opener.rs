@@ -17,18 +17,24 @@
 
 //! [`ParquetOpener`] for opening Parquet files
 
+use crate::deletion_vector::{DVWrappedStream, DeletionVectorHolder};
 use crate::page_filter::PagePruningAccessPlanFilter;
+use crate::row_filter::{self, FilterCandidateBuilder};
 use crate::row_group_filter::RowGroupAccessPlanFilter;
 use crate::{
     ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
-    apply_file_schema_type_coercions, coerce_int96_to_resolution, row_filter,
+    apply_file_schema_type_coercions, coerce_int96_to_resolution,
 };
-use arrow::array::{RecordBatch, RecordBatchOptions};
-use arrow::datatypes::DataType;
+use arrow::array::{BooleanArray, RecordBatch, RecordBatchOptions};
+use arrow::datatypes::{DataType, Field};
+use arrow::error::ArrowError;
+use datafusion_common::config::{ConfigOptions, FilterEvaluationStrategy};
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
+use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
+use parquet::arrow::data_cache::DataCache;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -47,7 +53,7 @@ use datafusion_physical_expr_common::physical_expr::{
     PhysicalExpr, is_dynamic_physical_expr,
 };
 use datafusion_physical_plan::metrics::{
-    Count, ExecutionPlanMetricsSet, MetricBuilder, PruningMetrics,
+    Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, PruningMetrics,
 };
 use datafusion_pruning::{FilePruner, PruningPredicate, build_pruning_predicate};
 
@@ -58,9 +64,11 @@ use datafusion_common::config::EncryptionFactoryOptions;
 use datafusion_execution::parquet_encryption::EncryptionFactory;
 use futures::{Stream, StreamExt, TryStreamExt, ready};
 use log::debug;
+use parquet::arrow::RowNumber;
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, RowSelectionPolicy,
+    ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter,
+    RowSelectionPolicy,
 };
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
@@ -107,6 +115,10 @@ pub(super) struct ParquetOpener {
     /// Optional parquet FileDecryptionProperties
     #[cfg(feature = "parquet_encryption")]
     pub file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
+    /// E6 data cache
+    pub data_cache_opt: Option<Arc<DataCache>>,
+    /// Config options
+    pub config_options_opt: Option<Arc<ConfigOptions>>,
     /// Rewrite expressions in the context of the file schema
     pub(crate) expr_adapter_factory: Arc<dyn PhysicalExprAdapterFactory>,
     /// Optional factory to create file decryption properties dynamically
@@ -274,6 +286,8 @@ impl FileOpener for ParquetOpener {
         let max_predicate_cache_size = self.max_predicate_cache_size;
 
         let reverse_row_groups = self.reverse_row_groups;
+        let data_cache_opt = self.data_cache_opt.clone();
+        let cfg_opts_opt = self.config_options_opt.clone();
         Ok(Box::pin(async move {
             #[cfg(feature = "parquet_encryption")]
             let file_decryption_properties = encryption_context
@@ -413,6 +427,19 @@ impl FileOpener for ParquetOpener {
                 &predicate_creation_errors,
             );
 
+            let deletion_vector_opt = partitioned_file.extensions.as_ref();
+            if deletion_vector_opt.is_some() {
+                let virtual_columns = vec![Arc::new(
+                    Field::new("row_number", DataType::Int64, false)
+                        .with_extension_type(RowNumber),
+                )];
+                options = options.with_virtual_columns(virtual_columns)?;
+                reader_metadata = ArrowReaderMetadata::try_new(
+                    Arc::clone(reader_metadata.metadata()),
+                    options.clone(),
+                )?;
+            }
+
             // The page index is not stored inline in the parquet footer so the
             // code above may not have read the page index structures yet. If we
             // need them for reading and they aren't yet loaded, we need to load them now.
@@ -434,30 +461,110 @@ impl FileOpener for ParquetOpener {
             );
 
             let indices = projection.column_indices();
+            if let Some(data_cache) = data_cache_opt {
+                builder = builder.with_parquet_file_path(file_name.clone());
+                builder = builder.with_data_cache(data_cache);
+            }
 
             let mask = ProjectionMask::roots(builder.parquet_schema(), indices);
 
             // Filter pushdown: evaluate predicates during scan
             if let Some(predicate) = pushdown_filters.then_some(predicate).flatten() {
-                let row_filter = row_filter::build_row_filter(
-                    &predicate,
-                    &physical_file_schema,
-                    builder.metadata(),
-                    reorder_predicates,
-                    &file_metrics,
-                );
+                if let Some(cfg_opts) = cfg_opts_opt {
+                    match cfg_opts.execution.filter_evaluation_strategy {
+                        FilterEvaluationStrategy::Datafusion => {
+                            let row_filter = row_filter::build_row_filter(
+                                &predicate,
+                                &physical_file_schema,
+                                builder.metadata(),
+                                reorder_predicates,
+                                &file_metrics,
+                            );
 
-                match row_filter {
-                    Ok(Some(filter)) => {
-                        builder = builder.with_row_filter(filter);
+                            match row_filter {
+                                Ok(Some(filter)) => {
+                                    builder = builder.with_row_filter(filter);
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    debug!(
+                                        "Ignoring error building row filter for '{predicate:?}': {e}"
+                                    );
+                                }
+                            };
+                        }
+                        FilterEvaluationStrategy::E6 => {
+                            let candidate = FilterCandidateBuilder::new(
+                                Arc::clone(&predicate),
+                                Arc::clone(&physical_file_schema),
+                                // Arc::clone(&predicate_file_schema),
+                                // Arc::clone(&schema_adapter_factory),
+                            )
+                            .build(builder.metadata())?
+                            .unwrap();
+
+                            let mask = ProjectionMask::roots(
+                                builder.metadata().file_metadata().schema_descr(),
+                                candidate.projection,
+                            );
+
+                            let physical_expr = reassign_expr_columns(
+                                candidate.expr,
+                                &candidate.filter_schema,
+                            )?;
+
+                            let row_filter = RowFilter::new(vec![Box::new(
+                                ArrowPredicateFn::new(mask, move |batch| {
+                                    // let batch =
+                                    //     candidate.schema_mapper.map_batch(batch)?;
+
+                                    let batch_size = batch.num_rows();
+
+                                    let columnar_value =
+                                        physical_expr.evaluate(&batch).map_err(|e| {
+                                            ArrowError::ExternalError(Box::new(e))
+                                        })?;
+
+                                    let bool_arr = match columnar_value {
+                                        ColumnarValue::Array(array) => array
+                                            .as_any()
+                                            .downcast_ref::<BooleanArray>()
+                                            .ok_or(ArrowError::ComputeError(
+                                                "unable to construct boolean filter mask"
+                                                    .to_string(),
+                                            ))?
+                                            .clone(),
+                                        ColumnarValue::Scalar(scalar) => {
+                                            // This can happen in cases like:
+                                            // - shortcircuit in binary expressions
+
+                                            // UX is a bit weird, ideally we
+                                            // should not do this, but arrow's
+                                            // predicate function expects a boolarr
+                                            // and there are cases where evaluate
+                                            // can return Scalar value, so one
+                                            // would have to expand them manually
+
+                                            // This is exactly what we do here
+                                            match scalar {
+                                                ScalarValue::Boolean(bool_opt) => vec![
+                                                    bool_opt.unwrap_or(false);
+                                                    batch_size
+                                                ]
+                                                .into(),
+                                                _ => unreachable!(),
+                                            }
+                                        }
+                                    };
+
+                                    Ok(bool_arr)
+                                }),
+                            )]);
+
+                            builder = builder.with_row_filter(row_filter);
+                        }
                     }
-                    Ok(None) => {}
-                    Err(e) => {
-                        debug!(
-                            "Ignoring error building row filter for '{predicate:?}': {e}"
-                        );
-                    }
-                };
+                }
             };
             if force_filter_selections {
                 builder =
@@ -570,13 +677,30 @@ impl FileOpener for ParquetOpener {
                 .with_metrics(arrow_reader_metrics.clone())
                 .build()?;
 
+            let stream_schema = Arc::clone(stream.schema());
+
+            let stream = stream.map_err(DataFusionError::from);
+
+            let stream = if let Some(deletion_vector) = deletion_vector_opt {
+                let deletion_vector = deletion_vector
+                    .downcast_ref::<Arc<DeletionVectorHolder>>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("DV missing in parquet".to_owned())
+                    })?;
+                DVWrappedStream::new(stream, Arc::clone(&deletion_vector)).boxed()
+            } else {
+                stream.boxed()
+            };
+
             let files_ranges_pruned_statistics =
                 file_metrics.files_ranges_pruned_statistics.clone();
             let predicate_cache_inner_records =
                 file_metrics.predicate_cache_inner_records.clone();
             let predicate_cache_records = file_metrics.predicate_cache_records.clone();
+            let max_memory_used = file_metrics.max_memory_used.clone();
+            let data_cache_bytes_hit = file_metrics.data_cache_bytes_hit.clone();
+            let data_cache_bytes_missed = file_metrics.data_cache_bytes_missed.clone();
 
-            let stream_schema = Arc::clone(stream.schema());
             // Check if we need to replace the schema to handle things like differing nullability or metadata.
             // See note below about file vs. output schema.
             let replace_schema = !stream_schema.eq(&output_schema);
@@ -589,12 +713,15 @@ impl FileOpener for ParquetOpener {
 
             let projector = projection.make_projector(&stream_schema)?;
 
-            let stream = stream.map_err(DataFusionError::from).map(move |b| {
+            let stream = stream.map(move |b| {
                 b.and_then(|mut b| {
                     copy_arrow_reader_metrics(
                         &arrow_reader_metrics,
                         &predicate_cache_inner_records,
                         &predicate_cache_records,
+                        &max_memory_used,
+                        &data_cache_bytes_hit,
+                        &data_cache_bytes_missed,
                     );
                     b = projector.project_batch(&b)?;
                     if replace_schema {
@@ -641,6 +768,9 @@ fn copy_arrow_reader_metrics(
     arrow_reader_metrics: &ArrowReaderMetrics,
     predicate_cache_inner_records: &Count,
     predicate_cache_records: &Count,
+    max_memory_used: &Gauge,
+    data_cache_bytes_hit: &Count,
+    data_cache_bytes_missed: &Count,
 ) {
     if let Some(v) = arrow_reader_metrics.records_read_from_inner() {
         predicate_cache_inner_records.add(v);
@@ -648,6 +778,18 @@ fn copy_arrow_reader_metrics(
 
     if let Some(v) = arrow_reader_metrics.records_read_from_cache() {
         predicate_cache_records.add(v);
+    }
+
+    if let Some(v) = arrow_reader_metrics.total_memory_used() {
+        max_memory_used.set_max(v);
+    }
+
+    if let Some(v) = arrow_reader_metrics.data_cache_bytes_hit() {
+        data_cache_bytes_hit.add(v);
+    }
+
+    if let Some(v) = arrow_reader_metrics.data_cache_bytes_missed() {
+        data_cache_bytes_missed.add(v);
     }
 }
 
@@ -696,6 +838,10 @@ fn constant_value_from_stats(
         && !min.is_null()
         && matches!(column_stats.null_count, Precision::Exact(0))
     {
+        // Cast to the expected data type if needed (e.g., Utf8 -> Dictionary)
+        if min.data_type() != *data_type {
+            return min.cast_to(data_type).ok();
+        }
         return Some(min.clone());
     }
 
@@ -774,6 +920,7 @@ where
         if self.done {
             return Poll::Ready(None);
         }
+
         match ready!(self.inner.poll_next_unpin(cx)) {
             None => {
                 // input done
@@ -1148,6 +1295,8 @@ mod test {
                 encryption_factory: None,
                 max_predicate_cache_size: self.max_predicate_cache_size,
                 reverse_row_groups: self.reverse_row_groups,
+                data_cache_opt: None,
+                config_options_opt: None,
             }
         }
     }
@@ -1954,4 +2103,39 @@ mod test {
             "Reverse scan with non-contiguous row groups should correctly map RowSelection"
         );
     }
+
+    // TODO: Readd this test back
+    // #[tokio::test]
+    // async fn test_deletion_vectors() {
+    //     let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+
+    //     let batch = record_batch!(
+    //         ("a", Int32, vec![Some(1), Some(2), Some(2)]),
+    //         ("b", Float32, vec![Some(1.0), Some(2.0), None])
+    //     )
+    //     .unwrap();
+
+    //     let data_size =
+    //         write_parquet(Arc::clone(&store), "test.parquet", batch.clone()).await;
+
+    //     let schema = batch.schema();
+    //     let deletion_vector = DeletionVectorHolder::try_new(vec![]);
+    //     let file = PartitionedFile::new(
+    //         "test.parquet".to_string(),
+    //         u64::try_from(data_size).unwrap(),
+    //     )
+    //     .with_extensions(Arc::new(deletion_vector));
+
+    //     let opener = ParquetOpenerBuilder::new()
+    //         .with_store(Arc::clone(&store))
+    //         .with_schema(Arc::clone(&schema))
+    //         .with_projection_indices(&[0, 1])
+    //         .with_row_group_stats_pruning(true)
+    //         .build();
+
+    //     let stream = opener.open(file).unwrap().await.unwrap();
+    //     let (num_batches, num_rows) = count_batches_and_rows(stream).await;
+    //     assert_eq!(num_batches, 1);
+    //     // assert_eq!(num_rows, 1);
+    // }
 }

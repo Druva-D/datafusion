@@ -24,6 +24,7 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use datafusion_physical_expr_common::metrics::MetricBuilder;
 use parking_lot::RwLock;
 
 use crate::common::spawn_buffered;
@@ -34,7 +35,7 @@ use crate::filter_pushdown::{
 };
 use crate::limit::LimitStream;
 use crate::metrics::{
-    BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, SpillMetrics,
+    BaselineMetrics, ExecutionPlanMetricsSet, Gauge, MetricsSet, SpillMetrics,
 };
 use crate::projection::{ProjectionExec, make_with_child, update_ordering};
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
@@ -250,6 +251,8 @@ struct ExternalSorter {
     reservation: MemoryReservation,
     spill_manager: SpillManager,
 
+    in_mem_batches_size: Gauge,
+
     /// Reservation for the merging of in-memory batches. If the sort
     /// might spill, `sort_spill_reservation_bytes` will be
     /// pre-reserved to ensure there is some space for this sort/merge.
@@ -275,6 +278,9 @@ impl ExternalSorter {
         metrics: &ExecutionPlanMetricsSet,
         runtime: Arc<RuntimeEnv>,
     ) -> Result<Self> {
+        let in_mem_batches_size =
+            MetricBuilder::new(metrics).gauge("in_mem_batches_size", partition_id);
+
         let metrics = ExternalSorterMetrics::new(metrics, partition_id);
         let reservation = MemoryConsumer::new(format!("ExternalSorter[{partition_id}]"))
             .with_can_spill(true)
@@ -305,6 +311,7 @@ impl ExternalSorter {
             batch_size,
             sort_spill_reservation_bytes,
             sort_in_place_threshold_bytes,
+            in_mem_batches_size,
         })
     }
 
@@ -798,7 +805,10 @@ impl ExternalSorter {
         let size = get_reserved_bytes_for_record_batch(input)?;
 
         match self.reservation.try_grow(size) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.in_mem_batches_size.add(size);
+                Ok(())
+            }
             Err(e) => {
                 if self.in_mem_batches.is_empty() {
                     return Err(Self::err_with_oom_context(e));
@@ -1306,12 +1316,15 @@ impl ExecutionPlan for SortExec {
                     &self.metrics_set,
                     Arc::clone(&unwrap_or_internal_err!(filter)),
                 )?;
+                let accumulator_state_size = MetricBuilder::new(&self.metrics_set)
+                    .gauge("accumulator_state_size", partition);
                 Ok(Box::pin(RecordBatchStreamAdapter::new(
                     self.schema(),
                     futures::stream::once(async move {
                         while let Some(batch) = input.next().await {
                             let batch = batch?;
                             topk.insert_batch(batch)?;
+                            accumulator_state_size.set_max(topk.size());
                             if topk.finished {
                                 break;
                             }

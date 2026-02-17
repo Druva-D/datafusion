@@ -25,7 +25,7 @@ use arrow::datatypes::{
     DECIMAL128_MAX_PRECISION, DECIMAL256_MAX_PRECISION, DataType, Decimal32Type,
     Decimal64Type, Decimal128Type, Decimal256Type, DurationMicrosecondType,
     DurationMillisecondType, DurationNanosecondType, DurationSecondType, FieldRef,
-    Float64Type, Int64Type, TimeUnit, UInt64Type,
+    Float32Type, Float64Type, Int32Type, Int64Type, TimeUnit, UInt32Type, UInt64Type,
 };
 use datafusion_common::types::{
     NativeType, logical_float64, logical_int8, logical_int16, logical_int32,
@@ -73,6 +73,15 @@ pub fn sum_distinct(expr: Expr) -> Expr {
 macro_rules! downcast_sum {
     ($args:ident, $helper:ident) => {
         match $args.return_field.data_type().clone() {
+            DataType::Int32 => {
+                $helper!(Int32Type, $args.return_field.data_type().clone())
+            }
+            DataType::UInt32 => {
+                $helper!(UInt32Type, $args.return_field.data_type().clone())
+            }
+            DataType::Float32 => {
+                $helper!(Float32Type, $args.return_field.data_type().clone())
+            }
             DataType::UInt64 => {
                 $helper!(UInt64Type, $args.return_field.data_type().clone())
             }
@@ -212,6 +221,9 @@ impl AggregateUDFImpl for Sum {
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         match &arg_types[0] {
+            DataType::Int32 => Ok(DataType::Int32),
+            DataType::UInt32 => Ok(DataType::UInt32),
+            DataType::Float32 => Ok(DataType::Float32),
             DataType::Int64 => Ok(DataType::Int64),
             DataType::UInt64 => Ok(DataType::UInt64),
             DataType::Float64 => Ok(DataType::Float64),

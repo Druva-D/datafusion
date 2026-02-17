@@ -24,7 +24,9 @@ use std::task::{Context, Poll};
 
 use super::utils::create_schema;
 use crate::execution_plan::EmissionType;
-use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use crate::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricsSet,
+};
 use crate::windows::{
     calc_requirements, get_ordered_partition_by_indices, get_partition_by_sort_exprs,
     window_equivalence_properties,
@@ -256,6 +258,9 @@ impl ExecutionPlan for WindowAggExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let accumulator_state_size =
+            MetricBuilder::new(&self.metrics).gauge("accumulator_state_size", partition);
+
         let input = self.input.execute(partition, context)?;
         let stream = Box::pin(WindowAggStream::new(
             Arc::clone(&self.schema),
@@ -264,6 +269,7 @@ impl ExecutionPlan for WindowAggExec {
             BaselineMetrics::new(&self.metrics, partition),
             self.partition_by_sort_keys()?,
             self.ordered_partition_by_indices.clone(),
+            accumulator_state_size,
         )?);
         Ok(stream)
     }
@@ -316,6 +322,7 @@ pub struct WindowAggStream {
     partition_by_sort_keys: Vec<PhysicalSortExpr>,
     baseline_metrics: BaselineMetrics,
     ordered_partition_by_indices: Vec<usize>,
+    accumulator_state_size: Gauge,
 }
 
 impl WindowAggStream {
@@ -327,6 +334,7 @@ impl WindowAggStream {
         baseline_metrics: BaselineMetrics,
         partition_by_sort_keys: Vec<PhysicalSortExpr>,
         ordered_partition_by_indices: Vec<usize>,
+        accumulator_state_size: Gauge,
     ) -> Result<Self> {
         // In WindowAggExec all partition by columns should be ordered.
         assert_eq_or_internal_err!(
@@ -343,6 +351,7 @@ impl WindowAggStream {
             baseline_metrics,
             partition_by_sort_keys,
             ordered_partition_by_indices,
+            accumulator_state_size,
         })
     }
 
@@ -417,6 +426,8 @@ impl WindowAggStream {
         loop {
             return Poll::Ready(Some(match ready!(self.input.poll_next_unpin(cx)) {
                 Some(Ok(batch)) => {
+                    self.accumulator_state_size
+                        .add(batch.get_array_memory_size());
                     self.batches.push(batch);
                     continue;
                 }

@@ -480,6 +480,7 @@ impl TableProvider for ListingTable {
         let file_source = self.create_file_source();
 
         // create the execution plan
+        let explain_options = &state.config_options().explain;
         let plan = self
             .options
             .format
@@ -494,6 +495,10 @@ impl TableProvider for ListingTable {
                     .with_output_ordering(output_ordering)
                     .with_expr_adapter(self.expr_adapter_factory.clone())
                     .with_partitioned_by_file_group(partitioned_by_file_group)
+                    .with_show_table_name(explain_options.show_datasource_table_name)
+                    .with_show_file_groups_summary(
+                        explain_options.show_file_groups_summary,
+                    )
                     .build(),
             )
             .await?;

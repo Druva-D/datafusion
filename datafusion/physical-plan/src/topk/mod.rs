@@ -623,7 +623,7 @@ impl TopK {
     }
 
     /// return the size of memory used by this operator, in bytes
-    fn size(&self) -> usize {
+    pub fn size(&self) -> usize {
         size_of::<Self>()
             + self.row_converter.size()
             + self.scratch_rows.size()

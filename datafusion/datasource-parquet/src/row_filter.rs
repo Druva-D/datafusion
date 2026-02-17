@@ -168,7 +168,7 @@ impl ArrowPredicate for DatafusionArrowPredicate {
 ///
 /// See the module level documentation for more information.
 pub(crate) struct FilterCandidate {
-    expr: Arc<dyn PhysicalExpr>,
+    pub expr: Arc<dyn PhysicalExpr>,
     /// Estimate for the total number of bytes that will need to be processed
     /// to evaluate this filter. This is used to estimate the cost of evaluating
     /// the filter and to order the filters when `reorder_predicates` is true.
@@ -177,10 +177,10 @@ pub(crate) struct FilterCandidate {
     /// Can this filter use an index (e.g. a page index) to prune rows?
     can_use_index: bool,
     /// Column indices into the parquet file schema required to evaluate this filter.
-    projection: Vec<usize>,
+    pub projection: Vec<usize>,
     /// The Arrow schema containing only the columns required by this filter,
     /// projected from the file's Arrow schema.
-    filter_schema: SchemaRef,
+    pub filter_schema: SchemaRef,
 }
 
 /// Helper to build a `FilterCandidate`.
@@ -192,7 +192,7 @@ pub(crate) struct FilterCandidate {
 /// Note: This does *not* handle any adaptation of the expression to the file schema.
 /// The expression must already be adapted before being passed in here, generally using
 /// [`PhysicalExprAdapter`](datafusion_physical_expr_adapter::PhysicalExprAdapter).
-struct FilterCandidateBuilder {
+pub struct FilterCandidateBuilder {
     expr: Arc<dyn PhysicalExpr>,
     /// The Arrow schema of this parquet file (the result of converting the
     /// parquet schema to Arrow, potentially with type coercions applied).
@@ -240,7 +240,7 @@ impl FilterCandidateBuilder {
 /// An expression cannot be pushed down if it references:
 /// - Non-primitive columns (like structs or lists)
 /// - Columns that don't exist in the file schema
-struct PushdownChecker<'schema> {
+pub struct PushdownChecker<'schema> {
     /// Does the expression require any non-primitive columns (like structs)?
     non_primitive_columns: bool,
     /// Does the expression reference any columns not present in the file schema?

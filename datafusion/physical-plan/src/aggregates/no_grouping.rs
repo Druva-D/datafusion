@@ -21,7 +21,7 @@ use crate::aggregates::{
     AccumulatorItem, AggrDynFilter, AggregateMode, DynamicFilterAggregateType,
     aggregate_expressions, create_accumulators, finalize_aggregation,
 };
-use crate::metrics::{BaselineMetrics, RecordOutput};
+use crate::metrics::{BaselineMetrics, Gauge, RecordOutput};
 use crate::{RecordBatchStream, SendableRecordBatchStream};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -72,6 +72,7 @@ struct AggregateStreamInner {
     // ==== Execution Resources ====
     baseline_metrics: BaselineMetrics,
     reservation: MemoryReservation,
+    accumulator_state_size: Gauge,
 }
 
 impl AggregateStreamInner {
@@ -274,6 +275,7 @@ impl AggregateStream {
         agg: &AggregateExec,
         context: &Arc<TaskContext>,
         partition: usize,
+        accumulator_state_size: Gauge,
     ) -> Result<Self> {
         let agg_schema = Arc::clone(&agg.schema);
         let agg_filter_expr = agg.filter_expr.clone();
@@ -324,6 +326,7 @@ impl AggregateStream {
             reservation,
             finished: false,
             agg_dyn_filter_state: maybe_dynamic_filter,
+            accumulator_state_size,
         };
 
         let stream = futures::stream::unfold(inner, |mut this| async move {
@@ -365,6 +368,7 @@ impl AggregateStream {
                     None => {
                         this.finished = true;
                         let timer = this.baseline_metrics.elapsed_compute().timer();
+                        this.accumulator_state_size.add(this.reservation.size());
                         let result =
                             finalize_aggregation(&mut this.accumulators, &this.mode)
                                 .and_then(|columns| {
