@@ -79,9 +79,12 @@ pub struct ParquetFileMetrics {
     /// reused for the output.
     pub predicate_cache_records: Count,
     /// Data Cache: total bytes retrieved from cache (hits)
-    pub data_cache_bytes_hit: Count,
+    pub data_cache_bytes_hit: Gauge,
     /// Data Cache: total bytes fetched from storage (misses)
-    pub data_cache_bytes_missed: Count,
+    pub data_cache_bytes_missed: Gauge,
+    /// Number of row groups that were not pruned but produced zero rows
+    /// after row-level filter evaluation
+    pub row_groups_fully_filtered: Gauge,
 }
 
 impl ParquetFileMetrics {
@@ -175,11 +178,15 @@ impl ParquetFileMetrics {
 
         let data_cache_bytes_hit = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
-            .counter("data_cache_bytes_hit", partition);
+            .gauge("data_cache_bytes_hit", partition);
 
         let data_cache_bytes_missed = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
-            .counter("data_cache_bytes_missed", partition);
+            .gauge("data_cache_bytes_missed", partition);
+
+        let row_groups_fully_filtered = MetricBuilder::new(metrics)
+            .with_new_label("filename", filename.to_string())
+            .gauge("row_groups_fully_filtered", partition);
 
         Self {
             files_ranges_pruned_statistics,
@@ -201,6 +208,7 @@ impl ParquetFileMetrics {
             predicate_cache_records,
             data_cache_bytes_hit,
             data_cache_bytes_missed,
+            row_groups_fully_filtered,
         }
     }
 }
