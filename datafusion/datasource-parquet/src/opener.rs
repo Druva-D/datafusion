@@ -700,6 +700,8 @@ impl FileOpener for ParquetOpener {
             let max_memory_used = file_metrics.max_memory_used.clone();
             let data_cache_bytes_hit = file_metrics.data_cache_bytes_hit.clone();
             let data_cache_bytes_missed = file_metrics.data_cache_bytes_missed.clone();
+            let row_groups_fully_filtered =
+                file_metrics.row_groups_fully_filtered.clone();
 
             // Check if we need to replace the schema to handle things like differing nullability or metadata.
             // See note below about file vs. output schema.
@@ -722,6 +724,7 @@ impl FileOpener for ParquetOpener {
                         &max_memory_used,
                         &data_cache_bytes_hit,
                         &data_cache_bytes_missed,
+                        &row_groups_fully_filtered,
                     );
                     b = projector.project_batch(&b)?;
                     if replace_schema {
@@ -769,8 +772,9 @@ fn copy_arrow_reader_metrics(
     predicate_cache_inner_records: &Count,
     predicate_cache_records: &Count,
     max_memory_used: &Gauge,
-    data_cache_bytes_hit: &Count,
-    data_cache_bytes_missed: &Count,
+    data_cache_bytes_hit: &Gauge,
+    data_cache_bytes_missed: &Gauge,
+    row_groups_fully_filtered: &Gauge,
 ) {
     if let Some(v) = arrow_reader_metrics.records_read_from_inner() {
         predicate_cache_inner_records.add(v);
@@ -785,11 +789,15 @@ fn copy_arrow_reader_metrics(
     }
 
     if let Some(v) = arrow_reader_metrics.data_cache_bytes_hit() {
-        data_cache_bytes_hit.add(v);
+        data_cache_bytes_hit.set(v);
     }
 
     if let Some(v) = arrow_reader_metrics.data_cache_bytes_missed() {
-        data_cache_bytes_missed.add(v);
+        data_cache_bytes_missed.set(v);
+    }
+
+    if let Some(v) = arrow_reader_metrics.row_groups_fully_filtered() {
+        row_groups_fully_filtered.set(v);
     }
 }
 
