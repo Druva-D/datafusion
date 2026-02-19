@@ -682,12 +682,15 @@ impl FileOpener for ParquetOpener {
             let stream = stream.map_err(DataFusionError::from);
 
             let stream = if let Some(deletion_vector) = deletion_vector_opt {
-                let deletion_vector = deletion_vector
-                    .downcast_ref::<Arc<DeletionVectorHolder>>()
-                    .ok_or_else(|| {
-                        DataFusionError::Internal("DV missing in parquet".to_owned())
-                    })?;
-                DVWrappedStream::new(stream, Arc::clone(&deletion_vector)).boxed()
+                let deletion_vector: Arc<DeletionVectorHolder> =
+                    Arc::clone(deletion_vector)
+                        .downcast::<DeletionVectorHolder>()
+                        .map_err(|_| {
+                            DataFusionError::Internal(
+                                "DV missing in parquet".to_owned(),
+                            )
+                        })?;
+                DVWrappedStream::new(stream, deletion_vector).boxed()
             } else {
                 stream.boxed()
             };
