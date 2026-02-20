@@ -147,7 +147,7 @@ impl UnionEquivalentOrderingBuilder {
     ) -> Result<()> {
         let constants = source.constants();
         let properties_constants = properties.constants();
-        for mut ordering in source.oeq_cache.normal_cls.clone() {
+        for mut ordering in source.oeq_class.iter().cloned() {
             // Progressively shorten the ordering to search for a satisfied prefix:
             loop {
                 ordering = match self.try_add_ordering(

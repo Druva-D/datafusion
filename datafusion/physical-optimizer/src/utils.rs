@@ -40,13 +40,7 @@ pub fn add_sort_above<T: Clone + Default>(
     sort_requirements: LexRequirement,
     fetch: Option<usize>,
 ) -> PlanContext<T> {
-    let mut sort_reqs: Vec<_> = sort_requirements.into();
-    sort_reqs.retain(|sort_expr| {
-        node.plan
-            .equivalence_properties()
-            .is_expr_constant(&sort_expr.expr)
-            .is_none()
-    });
+    let sort_reqs: Vec<_> = sort_requirements.into();
     let sort_exprs = sort_reqs.into_iter().map(Into::into).collect::<Vec<_>>();
     let Some(ordering) = LexOrdering::new(sort_exprs) else {
         return node;
