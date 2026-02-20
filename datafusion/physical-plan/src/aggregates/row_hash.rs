@@ -1321,6 +1321,7 @@ mod tests {
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_physical_expr::aggregate::AggregateExprBuilder;
     use datafusion_physical_expr::expressions::col;
+    use datafusion_physical_expr_common::metrics::ExecutionPlanMetricsSet;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -1405,9 +1406,16 @@ mod tests {
             Arc::clone(&schema),
         )?;
 
+        let accumulator_state_size = MetricBuilder::new(&ExecutionPlanMetricsSet::new())
+            .gauge("accumulator_state_size", 0);
+
         // Execute and collect results
-        let mut stream =
-            GroupedHashAggregateStream::new(&aggregate_exec, &Arc::clone(&task_ctx), 0)?;
+        let mut stream = GroupedHashAggregateStream::new(
+            &aggregate_exec,
+            &Arc::clone(&task_ctx),
+            0,
+            accumulator_state_size,
+        )?;
         let mut results = Vec::new();
 
         while let Some(result) = stream.next().await {
@@ -1548,9 +1556,16 @@ mod tests {
             Arc::clone(&schema),
         )?;
 
+        let accumulator_state_size = MetricBuilder::new(&ExecutionPlanMetricsSet::new())
+            .gauge("accumulator_state_size", 0);
+
         // Execute and collect results
-        let mut stream =
-            GroupedHashAggregateStream::new(&aggregate_exec, &Arc::clone(&task_ctx), 0)?;
+        let mut stream = GroupedHashAggregateStream::new(
+            &aggregate_exec,
+            &Arc::clone(&task_ctx),
+            0,
+            accumulator_state_size,
+        )?;
         let mut results = Vec::new();
 
         while let Some(result) = stream.next().await {
