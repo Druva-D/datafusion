@@ -8339,7 +8339,7 @@ mod tests {
             )))),
         ];
 
-        let check_array = |array| {
+        let check_array = |array: Arc<dyn Array>| {
             let is_null = is_null(&array).unwrap();
             assert_eq!(is_null, BooleanArray::from(vec![true, false, false]));
 
