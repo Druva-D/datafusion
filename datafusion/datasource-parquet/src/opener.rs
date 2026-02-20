@@ -686,9 +686,7 @@ impl FileOpener for ParquetOpener {
                     Arc::clone(deletion_vector)
                         .downcast::<DeletionVectorHolder>()
                         .map_err(|_| {
-                            DataFusionError::Internal(
-                                "DV missing in parquet".to_owned(),
-                            )
+                            DataFusionError::Internal("DV missing in parquet".to_owned())
                         })?;
                 DVWrappedStream::new(stream, deletion_vector).boxed()
             } else {
