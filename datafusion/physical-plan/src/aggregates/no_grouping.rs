@@ -43,7 +43,7 @@ use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::stream::{Stream, StreamExt};
 
 /// stream struct for aggregation without grouping columns
-pub(crate) struct AggregateStream {
+pub struct AggregateStream {
     stream: BoxStream<'static, Result<RecordBatch>>,
     schema: SchemaRef,
 }

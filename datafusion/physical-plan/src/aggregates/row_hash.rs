@@ -352,7 +352,7 @@ enum OutOfMemoryMode {
 /// │ 2 │ 2     │ 3.0 │    │ 2 │ 2     │ 3.0 │                   └────────────┘
 /// └─────────────────┘    └─────────────────┘
 /// ```
-pub(crate) struct GroupedHashAggregateStream {
+pub struct GroupedHashAggregateStream {
     // ========================================================================
     // PROPERTIES:
     // These fields are initialized at the start and remain constant throughout
@@ -688,6 +688,10 @@ impl GroupedHashAggregateStream {
             reduction_factor,
             accumulator_state_size,
         })
+    }
+
+    pub fn groups_len(&self) -> usize {
+        self.group_values.len()
     }
 }
 
@@ -1079,9 +1083,17 @@ impl GroupedHashAggregateStream {
         reservation_result
     }
 
+    pub fn update_mode(&mut self, mode: AggregateMode) {
+        self.mode = mode;
+    }
+
     /// Create an output RecordBatch with the group keys and
     /// accumulator states/values specified in emit_to
-    fn emit(&mut self, emit_to: EmitTo, spilling: bool) -> Result<Option<RecordBatch>> {
+    pub fn emit(
+        &mut self,
+        emit_to: EmitTo,
+        spilling: bool,
+    ) -> Result<Option<RecordBatch>> {
         let schema = if spilling {
             Arc::clone(&self.spill_state.spill_schema)
         } else {
