@@ -66,6 +66,7 @@ impl From<&protobuf::UnnestOptions> for UnnestOptions {
                     depth: r.depth as usize,
                 })
                 .collect::<Vec<_>>(),
+            append_unnested_columns: false,
         }
     }
 }

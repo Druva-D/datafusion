@@ -74,6 +74,9 @@ pub struct UnnestOptions {
     /// declare them here. Any unnested columns not being mentioned inside this option
     /// will be unnested with depth = 1
     pub recursions: Vec<RecursionUnnestOption>,
+    /// When true, unnested columns are appended after all original columns instead of
+    /// replacing the source columns in-place. Defaults to false (replace behavior).
+    pub append_unnested_columns: bool,
 }
 
 /// Instruction on how to unnest a column (mostly with a list type)
@@ -91,6 +94,7 @@ impl Default for UnnestOptions {
             // default to true to maintain backwards compatible behavior
             preserve_nulls: true,
             recursions: vec![],
+            append_unnested_columns: false,
         }
     }
 }
