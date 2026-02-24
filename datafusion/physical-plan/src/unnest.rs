@@ -539,7 +539,9 @@ fn list_unnest_at_level(
             // Repeat columns needed in future levels or not unnested.
             // In append mode, also repeat unnested columns so they expand
             // to the same length as the unnested output arrays.
-            needed_in_future_levels || !is_involved_in_unnesting || options.append_unnested_columns
+            needed_in_future_levels
+                || !is_involved_in_unnesting
+                || options.append_unnested_columns
         })
         .collect();
 
