@@ -537,7 +537,9 @@ fn list_unnest_at_level(
                 .any(|unnesting| unnesting.index_in_input_schema == i);
 
             // Repeat columns needed in future levels or not unnested.
-            needed_in_future_levels || !is_involved_in_unnesting
+            // In append mode, also repeat unnested columns so they expand
+            // to the same length as the unnested output arrays.
+            needed_in_future_levels || !is_involved_in_unnesting || options.append_unnested_columns
         })
         .collect();
 
@@ -712,19 +714,29 @@ fn build_batch(
                 )
                 .collect::<HashMap<_, _>>();
 
-            let ret = flatten_arrs
-                .into_iter()
-                .enumerate()
-                .flat_map(|(col_idx, arr)| {
-                    // Convert original column into its unnested version(s)
-                    // Plural because one column can be unnested with different recursion level
-                    // and into separate output columns
-                    match multi_unnested_per_original_index.remove(&col_idx) {
-                        Some(unnested_arrays) => unnested_arrays,
-                        None => vec![arr],
-                    }
-                })
-                .collect::<Vec<_>>();
+            let ret = if options.append_unnested_columns {
+                // Append mode: keep all original columns and append unnested arrays at the end
+                let mut ret: Vec<ArrayRef> = flatten_arrs.into_iter().collect();
+                let mut sorted_entries: Vec<_> =
+                    multi_unnested_per_original_index.into_iter().collect();
+                sorted_entries.sort_by_key(|(idx, _)| *idx);
+                for (_, unnested_arrays) in sorted_entries {
+                    ret.extend(unnested_arrays);
+                }
+                ret
+            } else {
+                // Replace mode: replace source columns with unnested arrays in-place
+                flatten_arrs
+                    .into_iter()
+                    .enumerate()
+                    .flat_map(|(col_idx, arr)| {
+                        match multi_unnested_per_original_index.remove(&col_idx) {
+                            Some(unnested_arrays) => unnested_arrays,
+                            None => vec![arr],
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
 
             flatten_struct_cols(&ret, schema, struct_column_indices)
         }
@@ -1194,6 +1206,7 @@ mod tests {
             &UnnestOptions {
                 preserve_nulls: true,
                 recursions: vec![],
+                append_unnested_columns: false,
             },
         )?
         .unwrap();
@@ -1281,6 +1294,7 @@ mod tests {
         let options = UnnestOptions {
             preserve_nulls,
             recursions: vec![],
+            append_unnested_columns: false,
         };
         let longest_length = find_longest_length(list_arrays, &options)?;
         let expected_array = Int64Array::from(expected);
