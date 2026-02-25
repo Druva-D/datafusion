@@ -23,7 +23,7 @@ mod custom;
 mod expression;
 mod value;
 
-use datafusion_common::HashMap;
+use datafusion_common::{HashMap, HashSet};
 use parking_lot::Mutex;
 use std::{
     borrow::Cow,
@@ -340,6 +340,21 @@ impl MetricsSet {
         Self {
             metrics: new_metrics,
         }
+    }
+
+    pub fn sum_for_names(&self, names: &HashSet<&str>) -> usize {
+        let mut sum = 0usize;
+        // There are all sorts of ways to make this more efficient
+        for metric in &self.metrics {
+            let key = metric.value.name();
+            if !names.contains(key) {
+                continue;
+            }
+
+            sum += metric.value.as_usize();
+        }
+
+        sum
     }
 
     /// Sort the order of metrics so the "most useful" show up first
