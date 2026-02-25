@@ -1083,10 +1083,6 @@ impl GroupedHashAggregateStream {
         reservation_result
     }
 
-    pub fn update_mode(&mut self, mode: AggregateMode) {
-        self.mode = mode;
-    }
-
     /// Create an output RecordBatch with the group keys and
     /// accumulator states/values specified in emit_to
     pub fn emit(
