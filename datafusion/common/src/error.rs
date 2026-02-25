@@ -572,11 +572,7 @@ impl DataFusionError {
             }
             DataFusionError::Configuration(ref desc) => Cow::Owned(desc.to_string()),
             DataFusionError::NotImplemented(ref desc) => Cow::Owned(desc.to_string()),
-            DataFusionError::Internal(ref desc) => Cow::Owned(format!(
-                "{desc}.\nThis issue was likely caused by a bug in DataFusion's code. \
-                Please help us to resolve this by filing a bug report in our issue tracker: \
-                https://github.com/apache/datafusion/issues"
-            )),
+            DataFusionError::Internal(ref desc) => Cow::Owned(format!("{desc}.")),
             DataFusionError::Plan(ref desc) => Cow::Owned(desc.to_string()),
             DataFusionError::SchemaError(ref desc, ref backtrace) => {
                 let backtrace: &str =
@@ -1131,7 +1127,6 @@ mod test {
             err.to_string(),
             @r"
         Internal error: Assertion failed: 1 == 2 (left: 1, right: 2): expected equality.
-        This issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues
         "
         );
     }
@@ -1154,7 +1149,6 @@ mod test {
             err.to_string(),
             @r"
         Internal error: Assertion failed: 3 != 3 (left: 3, right: 3): values must differ.
-        This issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues
         "
         );
     }
@@ -1178,7 +1172,6 @@ mod test {
             err.to_string(),
             @r"
         Internal error: Assertion failed: false.
-        This issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues
         "
         );
     }
@@ -1195,7 +1188,6 @@ mod test {
             err.to_string(),
             @r"
         Internal error: Assertion failed: false: custom message.
-        This issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues
         "
         );
     }
@@ -1212,7 +1204,6 @@ mod test {
             err.to_string(),
             @r"
         Internal error: Assertion failed: false: custom 42.
-        This issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues
         "
         );
     }
