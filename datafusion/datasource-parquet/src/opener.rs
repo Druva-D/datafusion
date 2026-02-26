@@ -455,7 +455,10 @@ impl FileOpener for ParquetOpener {
                 let cached = pruning_cache.lock().unwrap();
                 if let Some(ref c) = *cached {
                     // Cache hit: reuse pruning predicates from first file
-                    (c.pruning_predicate.clone(), c.page_pruning_predicate.clone())
+                    (
+                        c.pruning_predicate.clone(),
+                        c.page_pruning_predicate.clone(),
+                    )
                 } else {
                     drop(cached);
                     let result = build_pruning_predicates(
