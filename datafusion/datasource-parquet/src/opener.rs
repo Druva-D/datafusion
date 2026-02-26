@@ -493,16 +493,13 @@ impl FileOpener for ParquetOpener {
                             &physical_file_schema,
                             &predicate_creation_errors,
                         )?;
-                        *pruning_cache.lock().unwrap() =
-                            Some(CachedFileProcessingData {
-                                physical_file_schema: Arc::clone(
-                                    &physical_file_schema,
-                                ),
-                                simplified_predicate: result.0.clone(),
-                                simplified_projection: result.1.clone(),
-                                pruning_predicate: result.2.clone(),
-                                page_pruning_predicate: result.3.clone(),
-                            });
+                        *pruning_cache.lock().unwrap() = Some(CachedFileProcessingData {
+                            physical_file_schema: Arc::clone(&physical_file_schema),
+                            simplified_predicate: result.0.clone(),
+                            simplified_projection: result.1.clone(),
+                            pruning_predicate: result.2.clone(),
+                            page_pruning_predicate: result.3.clone(),
+                        });
                         result
                     }
                 } else {
