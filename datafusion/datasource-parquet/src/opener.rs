@@ -37,7 +37,7 @@ use datafusion_physical_expr_adapter::replace_columns_with_literals;
 use parquet::arrow::data_cache::DataCache;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use arrow::datatypes::{SchemaRef, TimeUnit};
@@ -73,6 +73,14 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader, RowGroupMetaData};
+
+/// Cached pruning predicates to avoid redundant per-file construction.
+/// When all files share the same schema and no per-file literal replacements
+/// were applied, the pruning predicates are identical and can be reused.
+pub(crate) struct CachedPruningData {
+    pruning_predicate: Option<Arc<PruningPredicate>>,
+    page_pruning_predicate: Option<Arc<PagePruningAccessPlanFilter>>,
+}
 
 /// Implements [`FileOpener`] for a parquet file
 pub(super) struct ParquetOpener {
@@ -130,6 +138,8 @@ pub(super) struct ParquetOpener {
     pub max_predicate_cache_size: Option<usize>,
     /// Whether to read row groups in reverse order
     pub reverse_row_groups: bool,
+    /// Cache for pruning predicates to avoid redundant per-file construction
+    pub(super) pruning_cache: Arc<Mutex<Option<CachedPruningData>>>,
 }
 
 /// Represents a prepared access plan with optional row selection
@@ -267,6 +277,20 @@ impl FileOpener for ParquetOpener {
                 .transpose()?;
         }
 
+        // Track whether the predicate was actually modified by literal columns.
+        // If the predicate Arc pointer is unchanged (no matching columns were replaced),
+        // pruning predicates can be cached and reused across files with the same schema.
+        let predicate_unchanged = match (&self.predicate, &predicate) {
+            (Some(orig), Some(curr)) => Arc::ptr_eq(orig, curr),
+            (None, None) => true,
+            _ => false,
+        };
+        // Cache pruning predicates when the predicate wasn't modified per-file.
+        // Even with dynamic filters, caching is safe: a slightly stale pruning
+        // predicate may miss some pruning opportunities but never produces wrong
+        // results (pruning is conservative — it only skips data proven irrelevant).
+        let can_cache_pruning = predicate_unchanged;
+
         let reorder_predicates = self.reorder_filters;
         let pushdown_filters = self.pushdown_filters;
         let force_filter_selections = self.force_filter_selections;
@@ -281,6 +305,7 @@ impl FileOpener for ParquetOpener {
         let expr_adapter_factory = Arc::clone(&self.expr_adapter_factory);
 
         let enable_page_index = self.enable_page_index;
+        let pruning_cache = Arc::clone(&self.pruning_cache);
         #[cfg(feature = "parquet_encryption")]
         let encryption_context = self.get_encryption_context();
         let max_predicate_cache_size = self.max_predicate_cache_size;
@@ -420,12 +445,38 @@ impl FileOpener for ParquetOpener {
             projection = projection
                 .try_map_exprs(|p| simplifier.simplify(rewriter.rewrite(p)?))?;
 
-            // Build predicates for this specific file
-            let (pruning_predicate, page_pruning_predicate) = build_pruning_predicates(
-                predicate.as_ref(),
-                &physical_file_schema,
-                &predicate_creation_errors,
-            );
+            // Try to reuse cached pruning predicates. When the predicate wasn't
+            // modified per-file, all files in a partition share the same schema
+            // and predicate, so pruning predicates are identical and can be reused.
+            // For dynamic filters: caching is safe because pruning is conservative —
+            // a slightly stale predicate may miss pruning opportunities but never
+            // produces wrong results.
+            let (pruning_predicate, page_pruning_predicate) = if can_cache_pruning {
+                let cached = pruning_cache.lock().unwrap();
+                if let Some(ref c) = *cached {
+                    // Cache hit: reuse pruning predicates from first file
+                    (c.pruning_predicate.clone(), c.page_pruning_predicate.clone())
+                } else {
+                    drop(cached);
+                    let result = build_pruning_predicates(
+                        predicate.as_ref(),
+                        &physical_file_schema,
+                        &predicate_creation_errors,
+                    );
+                    *pruning_cache.lock().unwrap() = Some(CachedPruningData {
+                        pruning_predicate: result.0.clone(),
+                        page_pruning_predicate: result.1.clone(),
+                    });
+                    result
+                }
+            } else {
+                // Cannot cache: predicate was modified per-file
+                build_pruning_predicates(
+                    predicate.as_ref(),
+                    &physical_file_schema,
+                    &predicate_creation_errors,
+                )
+            };
 
             let deletion_vector_opt = partitioned_file.extensions.as_ref();
             if deletion_vector_opt.is_some() {
@@ -1306,6 +1357,7 @@ mod test {
                 reverse_row_groups: self.reverse_row_groups,
                 data_cache_opt: None,
                 config_options_opt: None,
+                pruning_cache: Arc::new(Mutex::new(None)),
             }
         }
     }
