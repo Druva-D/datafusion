@@ -74,11 +74,20 @@ use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader, RowGroupMetaData};
 
-/// Cached pruning predicates to avoid redundant per-file construction.
-/// When all files share the same schema and no per-file literal replacements
-/// were applied, the pruning predicates are identical and can be reused.
-pub(crate) struct CachedPruningData {
+/// Cached file processing data to avoid redundant per-file rewrite, simplify,
+/// and pruning predicate construction. When all files share the same schema and
+/// no per-file literal replacements were applied, the entire pipeline output is
+/// identical and can be reused.
+pub(crate) struct CachedFileProcessingData {
+    /// The physical file schema this cache was built with
+    physical_file_schema: SchemaRef,
+    /// Simplified predicate (after rewrite + simplify)
+    simplified_predicate: Option<Arc<dyn PhysicalExpr>>,
+    /// Simplified projection (after rewrite + simplify)
+    simplified_projection: ProjectionExprs,
+    /// Pruning predicate for row group statistics pruning
     pruning_predicate: Option<Arc<PruningPredicate>>,
+    /// Page-level pruning predicate
     page_pruning_predicate: Option<Arc<PagePruningAccessPlanFilter>>,
 }
 
@@ -138,8 +147,8 @@ pub(super) struct ParquetOpener {
     pub max_predicate_cache_size: Option<usize>,
     /// Whether to read row groups in reverse order
     pub reverse_row_groups: bool,
-    /// Cache for pruning predicates to avoid redundant per-file construction
-    pub(super) pruning_cache: Arc<Mutex<Option<CachedPruningData>>>,
+    /// Cache for file processing data to avoid redundant per-file rewrite, simplify, and pruning
+    pub(super) pruning_cache: Arc<Mutex<Option<CachedFileProcessingData>>>,
 }
 
 /// Represents a prepared access plan with optional row selection
@@ -285,11 +294,19 @@ impl FileOpener for ParquetOpener {
             (None, None) => true,
             _ => false,
         };
-        // Cache pruning predicates when the predicate wasn't modified per-file.
-        // Even with dynamic filters, caching is safe: a slightly stale pruning
-        // predicate may miss some pruning opportunities but never produces wrong
-        // results (pruning is conservative — it only skips data proven irrelevant).
-        let can_cache_pruning = predicate_unchanged;
+        // Track whether the projection was actually modified by literal columns.
+        let projection_unchanged = self
+            .projection
+            .iter()
+            .zip(projection.iter())
+            .all(|(orig, new)| Arc::ptr_eq(&orig.expr, &new.expr));
+
+        // Cache the entire rewrite+simplify+pruning pipeline when neither predicate
+        // nor projection was modified per-file. Even with dynamic filters, caching is
+        // safe: a slightly stale pruning predicate may miss some pruning opportunities
+        // but never produces wrong results (pruning is conservative — it only skips
+        // data proven irrelevant).
+        let can_cache = predicate_unchanged && projection_unchanged;
 
         let reorder_predicates = self.reorder_filters;
         let pushdown_filters = self.pushdown_filters;
@@ -426,60 +443,79 @@ impl FileOpener for ParquetOpener {
                 )?;
             }
 
-            // Adapt the projection & filter predicate to the physical file schema.
-            // This evaluates missing columns and inserts any necessary casts.
-            // After rewriting to the file schema, further simplifications may be possible.
-            // For example, if `'a' = col_that_is_missing` becomes `'a' = NULL` that can then be simplified to `FALSE`
-            // and we can avoid doing any more work on the file (bloom filters, loading the page index, etc.).
-            // Additionally, if any casts were inserted we can move casts from the column to the literal side:
-            // `CAST(col AS INT) = 5` can become `col = CAST(5 AS <col type>)`, which can be evaluated statically.
-            let rewriter = expr_adapter_factory.create(
-                Arc::clone(&logical_file_schema),
-                Arc::clone(&physical_file_schema),
-            );
-            let simplifier = PhysicalExprSimplifier::new(&physical_file_schema);
-            predicate = predicate
-                .map(|p| simplifier.simplify(rewriter.rewrite(p)?))
-                .transpose()?;
-            // Adapt projections to the physical file schema as well
-            projection = projection
-                .try_map_exprs(|p| simplifier.simplify(rewriter.rewrite(p)?))?;
-
-            // Try to reuse cached pruning predicates. When the predicate wasn't
-            // modified per-file, all files in a partition share the same schema
-            // and predicate, so pruning predicates are identical and can be reused.
-            // For dynamic filters: caching is safe because pruning is conservative —
-            // a slightly stale predicate may miss pruning opportunities but never
-            // produces wrong results.
-            let (pruning_predicate, page_pruning_predicate) = if can_cache_pruning {
-                let cached = pruning_cache.lock().unwrap();
-                if let Some(ref c) = *cached {
-                    // Cache hit: reuse pruning predicates from first file
-                    (
-                        c.pruning_predicate.clone(),
-                        c.page_pruning_predicate.clone(),
-                    )
+            // Try to reuse the cached rewrite+simplify+pruning results.
+            // When neither predicate nor projection was modified per-file AND
+            // the physical file schema matches, the entire pipeline output is
+            // identical and we can skip all expression tree walks.
+            let (predicate, projection, pruning_predicate, page_pruning_predicate) =
+                if can_cache {
+                    let cached = pruning_cache.lock().unwrap();
+                    if let Some(ref c) = *cached {
+                        if c.physical_file_schema == physical_file_schema {
+                            // Cache hit: reuse rewritten+simplified exprs and pruning predicates
+                            (
+                                c.simplified_predicate.clone(),
+                                c.simplified_projection.clone(),
+                                c.pruning_predicate.clone(),
+                                c.page_pruning_predicate.clone(),
+                            )
+                        } else {
+                            // Schema changed (e.g. schema evolution) — recompute and update cache
+                            drop(cached);
+                            let result = rewrite_simplify_and_build_pruning(
+                                predicate,
+                                projection,
+                                &expr_adapter_factory,
+                                &logical_file_schema,
+                                &physical_file_schema,
+                                &predicate_creation_errors,
+                            )?;
+                            *pruning_cache.lock().unwrap() =
+                                Some(CachedFileProcessingData {
+                                    physical_file_schema: Arc::clone(
+                                        &physical_file_schema,
+                                    ),
+                                    simplified_predicate: result.0.clone(),
+                                    simplified_projection: result.1.clone(),
+                                    pruning_predicate: result.2.clone(),
+                                    page_pruning_predicate: result.3.clone(),
+                                });
+                            result
+                        }
+                    } else {
+                        // First file — compute and populate cache
+                        drop(cached);
+                        let result = rewrite_simplify_and_build_pruning(
+                            predicate,
+                            projection,
+                            &expr_adapter_factory,
+                            &logical_file_schema,
+                            &physical_file_schema,
+                            &predicate_creation_errors,
+                        )?;
+                        *pruning_cache.lock().unwrap() =
+                            Some(CachedFileProcessingData {
+                                physical_file_schema: Arc::clone(
+                                    &physical_file_schema,
+                                ),
+                                simplified_predicate: result.0.clone(),
+                                simplified_projection: result.1.clone(),
+                                pruning_predicate: result.2.clone(),
+                                page_pruning_predicate: result.3.clone(),
+                            });
+                        result
+                    }
                 } else {
-                    drop(cached);
-                    let result = build_pruning_predicates(
-                        predicate.as_ref(),
+                    // Per-file literal replacements applied — cannot cache
+                    rewrite_simplify_and_build_pruning(
+                        predicate,
+                        projection,
+                        &expr_adapter_factory,
+                        &logical_file_schema,
                         &physical_file_schema,
                         &predicate_creation_errors,
-                    );
-                    *pruning_cache.lock().unwrap() = Some(CachedPruningData {
-                        pruning_predicate: result.0.clone(),
-                        page_pruning_predicate: result.1.clone(),
-                    });
-                    result
-                }
-            } else {
-                // Cannot cache: predicate was modified per-file
-                build_pruning_predicates(
-                    predicate.as_ref(),
-                    &physical_file_schema,
-                    &predicate_creation_errors,
-                )
-            };
+                    )?
+                };
 
             let deletion_vector_opt = partitioned_file.extensions.as_ref();
             if deletion_vector_opt.is_some() {
@@ -1050,6 +1086,57 @@ impl EncryptionContext {
     }
 }
 
+/// Runs the full rewrite+simplify+pruning pipeline for a file:
+/// 1. Rewrites predicate and projection to the physical file schema
+/// 2. Simplifies the rewritten expressions
+/// 3. Builds pruning predicates from the simplified predicate
+///
+/// Returns (simplified_predicate, simplified_projection, pruning_predicate, page_pruning_predicate)
+fn rewrite_simplify_and_build_pruning(
+    predicate: Option<Arc<dyn PhysicalExpr>>,
+    projection: ProjectionExprs,
+    expr_adapter_factory: &Arc<dyn PhysicalExprAdapterFactory>,
+    logical_file_schema: &SchemaRef,
+    physical_file_schema: &SchemaRef,
+    predicate_creation_errors: &Count,
+) -> Result<(
+    Option<Arc<dyn PhysicalExpr>>,
+    ProjectionExprs,
+    Option<Arc<PruningPredicate>>,
+    Option<Arc<PagePruningAccessPlanFilter>>,
+)> {
+    // Adapt the projection & filter predicate to the physical file schema.
+    // This evaluates missing columns and inserts any necessary casts.
+    // After rewriting to the file schema, further simplifications may be possible.
+    // For example, if `'a' = col_that_is_missing` becomes `'a' = NULL` that can
+    // then be simplified to `FALSE` and we can avoid doing any more work on the file.
+    // Additionally, if any casts were inserted we can move casts from the column to
+    // the literal side: `CAST(col AS INT) = 5` can become `col = CAST(5 AS <col type>)`.
+    let rewriter = expr_adapter_factory.create(
+        Arc::clone(logical_file_schema),
+        Arc::clone(physical_file_schema),
+    );
+    let simplifier = PhysicalExprSimplifier::new(physical_file_schema);
+    let predicate = predicate
+        .map(|p| simplifier.simplify(rewriter.rewrite(p)?))
+        .transpose()?;
+    let projection =
+        projection.try_map_exprs(|p| simplifier.simplify(rewriter.rewrite(p)?))?;
+
+    let (pruning_predicate, page_pruning_predicate) = build_pruning_predicates(
+        predicate.as_ref(),
+        physical_file_schema,
+        predicate_creation_errors,
+    );
+
+    Ok((
+        predicate,
+        projection,
+        pruning_predicate,
+        page_pruning_predicate,
+    ))
+}
+
 impl ParquetOpener {
     #[cfg(feature = "parquet_encryption")]
     fn get_encryption_context(&self) -> EncryptionContext {
@@ -1177,7 +1264,7 @@ fn should_enable_page_index(
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use super::{ConstantColumns, constant_columns_from_stats};
     use crate::{DefaultParquetFileReaderFactory, RowGroupAccess, opener::ParquetOpener};
