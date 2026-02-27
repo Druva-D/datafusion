@@ -130,7 +130,7 @@ struct SkipAggregationProbe {
     /// Maximum ratio of `num_groups` to `input_rows` for continuing aggregation
     /// (from `SessionConfig`). If the ratio exceeds this value, aggregation
     /// is skipped and input rows are directly converted to output
-    probe_ratio_threshold: f64,
+    _probe_ratio_threshold: f64,
 
     // ========================================================================
     // STATES:
@@ -171,7 +171,7 @@ impl SkipAggregationProbe {
             input_rows: 0,
             num_groups: 0,
             probe_rows_threshold,
-            probe_ratio_threshold,
+            _probe_ratio_threshold: probe_ratio_threshold,
             should_skip: false,
             is_locked: false,
             skipped_aggregation_rows,
@@ -191,8 +191,7 @@ impl SkipAggregationProbe {
         self.input_rows += input_rows;
         self.num_groups = num_groups;
         if self.input_rows >= self.probe_rows_threshold {
-            self.should_skip = self.num_groups as f64 / self.input_rows as f64
-                >= self.probe_ratio_threshold;
+            self.should_skip = self.num_groups >= 256 * 1024;
             // Set is_locked to true only if we have decided to skip, otherwise we can try to skip
             // during processing the next record_batch.
             self.is_locked = self.should_skip;

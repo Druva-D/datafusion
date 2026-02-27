@@ -992,11 +992,6 @@ impl ExecutionPlan for HashJoinExec {
                         .session_config()
                         .options()
                         .optimizer
-                        .hash_join_inlist_pushdown_max_size,
-                    context
-                        .session_config()
-                        .options()
-                        .optimizer
                         .hash_join_inlist_pushdown_max_distinct_values,
                 ))
             })?,
@@ -1016,11 +1011,6 @@ impl ExecutionPlan for HashJoinExec {
                     need_produce_result_in_final(self.join_type),
                     1,
                     enable_dynamic_filter_pushdown,
-                    context
-                        .session_config()
-                        .options()
-                        .optimizer
-                        .hash_join_inlist_pushdown_max_size,
                     context
                         .session_config()
                         .options()
@@ -1514,7 +1504,6 @@ async fn collect_left_input(
     with_visited_indices_bitmap: bool,
     probe_threads_count: usize,
     should_compute_dynamic_filters: bool,
-    max_inlist_size: usize,
     max_inlist_distinct_values: usize,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
@@ -1645,20 +1634,24 @@ async fn collect_left_input(
         // If the build side is small enough we can use IN list pushdown.
         // If it's too big we fall back to pushing down a reference to the hash table.
         // See `PushdownStrategy` for more details.
-        let estimated_size = left_values
-            .iter()
-            .map(|arr| arr.get_array_memory_size())
-            .sum::<usize>();
+        // let estimated_size = left_values
+        //     .iter()
+        //     .map(|arr| arr.get_array_memory_size())
+        //     .sum::<usize>();
+        // if left_values.is_empty()
+        //     || left_values[0].is_empty()
+        //     || estimated_size > max_inlist_size
+        //     || hash_map.len() > max_inlist_distinct_values
         if left_values.is_empty()
             || left_values[0].is_empty()
-            || estimated_size > max_inlist_size
+            // || estimated_size > max_inlist_size
             || hash_map.len() > max_inlist_distinct_values
         {
-            PushdownStrategy::HashTable(Arc::clone(&hash_map))
+            PushdownStrategy::Empty //PushdownStrategy::HashTable(Arc::clone(&hash_map))
         } else if let Some(in_list_values) = build_struct_inlist_values(&left_values)? {
             PushdownStrategy::InList(in_list_values)
         } else {
-            PushdownStrategy::HashTable(Arc::clone(&hash_map))
+            PushdownStrategy::Empty //PushdownStrategy::HashTable(Arc::clone(&hash_map))
         }
     };
 

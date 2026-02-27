@@ -36,11 +36,12 @@ use datafusion_common::{
     DFSchema, HashSet, Result, ScalarValue, assert_or_internal_err, exec_datafusion_err,
     exec_err,
 };
-use datafusion_expr::{ColumnarValue, expr_vec_fmt};
+use datafusion_expr::ColumnarValue;
 
 use ahash::RandomState;
 use datafusion_common::HashMap;
 use hashbrown::hash_map::RawEntryMut;
+use itertools::Itertools;
 
 /// Trait for InList static filters
 trait StaticFilter {
@@ -48,6 +49,8 @@ trait StaticFilter {
 
     /// Checks if values in `v` are contained in the filter
     fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray>;
+
+    fn len(&self) -> usize;
 }
 
 /// InList
@@ -56,14 +59,19 @@ pub struct InListExpr {
     list: Vec<Arc<dyn PhysicalExpr>>,
     negated: bool,
     static_filter: Option<Arc<dyn StaticFilter + Send + Sync>>,
+    hash_set_scalar: Option<Arc<std::collections::HashSet<ScalarValue>>>,
 }
 
 impl Debug for InListExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.debug_struct("InListExpr")
             .field("expr", &self.expr)
-            .field("list", &self.list)
+            .field("list size", &self.list.len())
             .field("negated", &self.negated)
+            .field(
+                "static_filter size",
+                &self.static_filter.as_ref().map(|f| f.len()),
+            )
             .finish()
     }
 }
@@ -135,6 +143,10 @@ impl StaticFilter for ArrayStaticFilter {
                 })
                 .collect())
         })
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
     }
 }
 
@@ -211,6 +223,24 @@ impl ArrayStaticFilter {
             map,
         })
     }
+}
+
+fn make_hash_set_scalar(
+    array: &dyn Array,
+) -> Arc<std::collections::HashSet<ScalarValue>> {
+    let mut set = std::collections::HashSet::with_capacity(array.len());
+    for idx in 0..array.len() {
+        if array.is_valid(idx) {
+            if let Some(scalar_value) = ScalarValue::try_from_array(array, idx).ok() {
+                match scalar_value {
+                    ScalarValue::Dictionary(_, v) => set.insert(*v),
+                    _ => set.insert(scalar_value),
+                };
+            }
+        }
+    }
+
+    Arc::new(set)
 }
 
 /// Wrapper for f32 that implements Hash and Eq using bit comparison.
@@ -386,6 +416,10 @@ macro_rules! primitive_static_filter {
 
                 Ok(BooleanArray::new(contains_buffer, result_nulls))
             }
+
+            fn len(&self) -> usize {
+                self.values.len()
+            }
         }
     };
 }
@@ -524,6 +558,10 @@ macro_rules! float_static_filter {
 
                 Ok(BooleanArray::new(contains_buffer, result_nulls))
             }
+
+            fn len(&self) -> usize {
+                self.values.len()
+            }
         }
     };
 }
@@ -585,12 +623,14 @@ impl InListExpr {
         list: Vec<Arc<dyn PhysicalExpr>>,
         negated: bool,
         static_filter: Option<Arc<dyn StaticFilter + Send + Sync>>,
+        hash_set_scalar: Option<Arc<std::collections::HashSet<ScalarValue>>>,
     ) -> Self {
         Self {
             expr,
             list,
             negated,
             static_filter,
+            hash_set_scalar,
         }
     }
 
@@ -617,6 +657,13 @@ impl InListExpr {
         self.negated
     }
 
+    /// Returns the internal hash_set of scalar values
+    pub fn hash_set_scalar(
+        &self,
+    ) -> Option<&Arc<std::collections::HashSet<ScalarValue>>> {
+        self.hash_set_scalar.as_ref()
+    }
+
     /// Create a new InList expression directly from an array, bypassing expression evaluation.
     ///
     /// This is more efficient than `in_list()` when you already have the list as an array,
@@ -633,17 +680,13 @@ impl InListExpr {
         array: ArrayRef,
         negated: bool,
     ) -> Result<Self> {
-        let list = (0..array.len())
-            .map(|i| {
-                let scalar = ScalarValue::try_from_array(array.as_ref(), i)?;
-                Ok(crate::expressions::lit(scalar) as Arc<dyn PhysicalExpr>)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let scalar_hash_set = make_hash_set_scalar(array.as_ref());
         Ok(Self::new(
             expr,
-            list,
+            Vec::new(),
             negated,
             Some(instantiate_static_filter(array)?),
+            Some(scalar_hash_set),
         ))
     }
 
@@ -680,12 +723,42 @@ impl InListExpr {
             None => None, // Non-constant expressions, fall back to dynamic evaluation
         };
 
-        Ok(Self::new(expr, list, negated, static_filter))
+        Ok(Self::new(expr, list, negated, static_filter, None))
     }
 }
 impl std::fmt::Display for InListExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let list = expr_vec_fmt!(self.list);
+        let mut list: String = String::new();
+        if !self.list.is_empty() {
+            list = self
+                .list
+                .iter()
+                .take(10)
+                .map(|e| format!("{e}"))
+                .collect::<Vec<String>>()
+                .join(", ");
+            if self.list.len() > 10 {
+                list.push_str(format!("...+{} elements", self.list.len() - 10).as_str())
+            }
+        } else if let Some(hash_set_scalar) = self.hash_set_scalar.as_ref() {
+            if !hash_set_scalar.is_empty() {
+                list = hash_set_scalar
+                    .iter()
+                    .take(10)
+                    .map(|s| format!("{s}"))
+                    .join(", ");
+                if hash_set_scalar.len() > 10 {
+                    list.push_str(
+                        format!("...+{} elements", hash_set_scalar.len() - 10).as_str(),
+                    )
+                }
+            }
+        } else if let Some(static_filter) = self.static_filter.as_ref() {
+            let static_filter_len = static_filter.len();
+            if static_filter_len > 0 {
+                list = format!("static_filter[{}]", static_filter_len)
+            }
+        }
 
         if self.negated {
             if self.static_filter.is_some() {
@@ -844,6 +917,7 @@ impl PhysicalExpr for InListExpr {
             children[1..].to_vec(),
             self.negated,
             self.static_filter.as_ref().map(Arc::clone),
+            self.hash_set_scalar.as_ref().map(Arc::clone),
         )))
     }
 
@@ -2110,7 +2184,7 @@ mod tests {
 
         // Use InListExpr::new directly (not in_list()) to bypass array optimization
         // This creates an InList without a static filter
-        let expr = Arc::new(InListExpr::new(Arc::clone(&col_a), list, false, None));
+        let expr = Arc::new(InListExpr::new(Arc::clone(&col_a), list, false, None, None));
 
         // Verify that the expression doesn't have a static filter
         // by checking the display string does NOT contain "(SET)"
@@ -2152,6 +2226,7 @@ mod tests {
                 )))),
             ],
             true,
+            None,
             None,
         ));
 

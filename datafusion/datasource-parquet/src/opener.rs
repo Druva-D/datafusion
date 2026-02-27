@@ -50,7 +50,7 @@ use datafusion_datasource::{PartitionedFile, TableSchema};
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::{
-    PhysicalExpr, is_dynamic_physical_expr,
+    PhysicalExpr, is_dynamic_physical_expr, snapshot_physical_expr_opt,
 };
 use datafusion_physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, PruningMetrics,
@@ -469,7 +469,11 @@ impl FileOpener for ParquetOpener {
             let mask = ProjectionMask::roots(builder.parquet_schema(), indices);
 
             // Filter pushdown: evaluate predicates during scan
-            if let Some(predicate) = pushdown_filters.then_some(predicate).flatten() {
+            if let Some(mut predicate) = pushdown_filters.then_some(predicate).flatten() {
+                if is_dynamic_physical_expr(&predicate) {
+                    predicate = snapshot_physical_expr_opt(Arc::clone(&predicate))?.data;
+                }
+                // println!("{:?}", predicate);
                 if let Some(cfg_opts) = cfg_opts_opt {
                     match cfg_opts.execution.filter_evaluation_strategy {
                         FilterEvaluationStrategy::Datafusion => {

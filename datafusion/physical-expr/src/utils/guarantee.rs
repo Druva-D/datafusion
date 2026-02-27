@@ -74,7 +74,7 @@ use std::sync::Arc;
 pub struct LiteralGuarantee {
     pub column: Column,
     pub guarantee: Guarantee,
-    pub literals: HashSet<ScalarValue>,
+    pub literals: Arc<HashSet<ScalarValue>>,
 }
 
 /// What is guaranteed about the values for a [`LiteralGuarantee`]?
@@ -103,7 +103,7 @@ impl LiteralGuarantee {
         Self {
             column: Column::from_name(column_name),
             guarantee,
-            literals,
+            literals: Arc::new(literals),
         }
     }
 
@@ -129,12 +129,33 @@ impl LiteralGuarantee {
                     .as_any()
                     .downcast_ref::<crate::expressions::InListExpr>()
                 {
-                    if let Some(inlist) = ColInList::try_new(inlist) {
-                        builder.aggregate_multi_conjunct(
-                            inlist.col,
-                            inlist.guarantee,
-                            inlist.list.iter().map(|lit| lit.value()),
-                        )
+                    if let Some(col_inlist) = ColInList::try_new(inlist) {
+                        if inlist.hash_set_scalar().is_some() {
+                            let key = (col_inlist.col, col_inlist.guarantee);
+                            if *(&builder.map.get(&key).is_some()) {
+                                builder.aggregate_multi_conjunct(
+                                    col_inlist.col,
+                                    col_inlist.guarantee,
+                                    inlist.hash_set_scalar().unwrap().as_ref().iter(),
+                                )
+                            } else {
+                                let guarantee = LiteralGuarantee {
+                                    column: Column::from_name(col_inlist.col.name()),
+                                    guarantee: col_inlist.guarantee,
+                                    literals: Arc::clone(
+                                        inlist.hash_set_scalar().unwrap(),
+                                    ),
+                                };
+                                // add it to the list of guarantees
+                                builder.add_new_guarantee(key, guarantee)
+                            }
+                        } else {
+                            builder.aggregate_multi_conjunct(
+                                col_inlist.col,
+                                col_inlist.guarantee,
+                                col_inlist.list.iter().map(|lit| lit.value()),
+                            )
+                        }
                     } else {
                         builder
                     }
@@ -247,22 +268,23 @@ impl LiteralGuarantee {
 
 impl Display for LiteralGuarantee {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let mut sorted_literals: Vec<_> =
-            self.literals.iter().map(|lit| lit.to_string()).collect();
-        sorted_literals.sort();
+        let mut sorted_literals: String = self
+            .literals
+            .iter()
+            .map(|lit| lit.to_string())
+            .take(10)
+            .collect::<Vec<String>>()
+            .join(", ");
+        if self.literals.len() > 10 {
+            sorted_literals
+                .push_str(format!("...+{} elements", self.literals.len() - 10).as_str());
+        }
+        // sorted_literals.sort();
         match self.guarantee {
-            Guarantee::In => write!(
-                f,
-                "{} in ({})",
-                self.column.name,
-                sorted_literals.join(", ")
-            ),
-            Guarantee::NotIn => write!(
-                f,
-                "{} not in ({})",
-                self.column.name,
-                sorted_literals.join(", ")
-            ),
+            Guarantee::In => write!(f, "{} in ({})", self.column.name, sorted_literals),
+            Guarantee::NotIn => {
+                write!(f, "{} not in ({})", self.column.name, sorted_literals)
+            }
         }
     }
 }
@@ -337,7 +359,12 @@ impl<'a> GuaranteeBuilder<'a> {
                 // for the expression to be true
                 Guarantee::NotIn => {
                     let new_values: HashSet<_> = new_values.into_iter().collect();
-                    existing.literals.extend(new_values.into_iter().cloned());
+                    let mut literals = HashSet::with_capacity(
+                        existing.literals.len() + new_values.len(),
+                    );
+                    literals.extend(existing.literals.iter().cloned());
+                    literals.extend(new_values.into_iter().cloned());
+                    existing.literals = Arc::new(literals);
                 }
                 Guarantee::In => {
                     let intersection = new_values
@@ -349,7 +376,8 @@ impl<'a> GuaranteeBuilder<'a> {
                     // otherwise, we invalidate the guarantee
                     // e.g. `a IN (1,2,3) AND a IN (4,5,6)` is `a IN ()`, which is invalid
                     if !intersection.is_empty() {
-                        existing.literals = intersection.into_iter().cloned().collect();
+                        existing.literals =
+                            Arc::new(intersection.into_iter().cloned().collect());
                     } else {
                         // at least one was not, so invalidate the guarantee
                         *entry = None;
@@ -362,10 +390,19 @@ impl<'a> GuaranteeBuilder<'a> {
 
             let guarantee = LiteralGuarantee::new(col.name(), guarantee, new_values);
             // add it to the list of guarantees
-            self.guarantees.push(Some(guarantee));
-            self.map.insert(key, self.guarantees.len() - 1);
+            self = self.add_new_guarantee(key, guarantee);
         }
 
+        self
+    }
+
+    fn add_new_guarantee(
+        mut self,
+        key: (&'a crate::expressions::Column, Guarantee),
+        guarantee: LiteralGuarantee,
+    ) -> Self {
+        self.guarantees.push(Some(guarantee));
+        self.map.insert(key, self.guarantees.len() - 1);
         self
     }
 

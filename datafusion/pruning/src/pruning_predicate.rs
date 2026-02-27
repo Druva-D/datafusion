@@ -473,8 +473,10 @@ impl PruningPredicate {
             // children after snapshotting and previously `replace_columns_with_literals` may have been called with partition values
             // the expression we have now is `8 < 5 and col < 10`.
             // Thus we need as simplifier pass to get `false and col < 10` => `false` here.
-            let simplifier = PhysicalExprSimplifier::new(&schema);
-            expr = simplifier.simplify(tf.data)?;
+            // TODO: Revisit this to bring the simplifier back
+            // let simplifier = PhysicalExprSimplifier::new(&schema);
+            // expr = simplifier.simplify(tf.data)?;
+            expr = tf.data;
         } else {
             expr = tf.data;
         }

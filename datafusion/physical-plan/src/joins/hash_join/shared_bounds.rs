@@ -26,10 +26,7 @@ use crate::ExecutionPlanProperties;
 use crate::joins::PartitionMode;
 use crate::joins::hash_join::exec::HASH_JOIN_SEED;
 use crate::joins::hash_join::inlist_builder::build_struct_fields;
-use crate::joins::hash_join::partitioned_hash_eval::{
-    HashExpr, HashTableLookupExpr, SeededRandomState,
-};
-use crate::joins::utils::JoinHashMapType;
+use crate::joins::hash_join::partitioned_hash_eval::{HashExpr, SeededRandomState};
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion_common::config::ConfigOptions;
@@ -88,7 +85,7 @@ impl PartitionBounds {
 fn create_membership_predicate(
     on_right: &[PhysicalExprRef],
     pushdown: PushdownStrategy,
-    random_state: &SeededRandomState,
+    _random_state: &SeededRandomState,
     schema: &Schema,
 ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
     match pushdown {
@@ -127,20 +124,20 @@ fn create_membership_predicate(
                 false,
             )?)))
         }
-        // Use hash table lookup for large build sides
-        PushdownStrategy::HashTable(hash_map) => {
-            let lookup_hash_expr = Arc::new(HashExpr::new(
-                on_right.to_vec(),
-                random_state.clone(),
-                "hash_join".to_string(),
-            )) as Arc<dyn PhysicalExpr>;
-
-            Ok(Some(Arc::new(HashTableLookupExpr::new(
-                lookup_hash_expr,
-                hash_map,
-                "hash_lookup".to_string(),
-            )) as Arc<dyn PhysicalExpr>))
-        }
+        // // Use hash table lookup for large build sides
+        // PushdownStrategy::HashTable(hash_map) => {
+        //     let lookup_hash_expr = Arc::new(HashExpr::new(
+        //         on_right.to_vec(),
+        //         random_state.clone(),
+        //         "hash_join".to_string(),
+        //     )) as Arc<dyn PhysicalExpr>;
+        //
+        //     Ok(Some(Arc::new(HashTableLookupExpr::new(
+        //         lookup_hash_expr,
+        //         hash_map,
+        //         "hash_lookup".to_string(),
+        //     )) as Arc<dyn PhysicalExpr>))
+        // }
         // Empty partition - should not create a filter for this
         PushdownStrategy::Empty => Ok(None),
     }
@@ -240,8 +237,8 @@ pub(crate) struct SharedBuildAccumulator {
 pub(crate) enum PushdownStrategy {
     /// Use InList for small build sides (< 128MB)
     InList(ArrayRef),
-    /// Use hash table lookup for large build sides
-    HashTable(Arc<dyn JoinHashMapType>),
+    // /// Use hash table lookup for large build sides
+    // HashTable(Arc<dyn JoinHashMapType>),
     /// There was no data in this partition, do not build a dynamic filter for it
     Empty,
 }
