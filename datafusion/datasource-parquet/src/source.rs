@@ -19,7 +19,7 @@
 use std::any::Any;
 use std::fmt::Debug;
 use std::fmt::Formatter;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::DefaultParquetFileReaderFactory;
 use crate::ParquetFileReaderFactory;
@@ -577,6 +577,7 @@ impl FileSource for ParquetSource {
             encryption_factory: self.get_encryption_factory_with_config(),
             max_predicate_cache_size: self.max_predicate_cache_size(),
             reverse_row_groups: self.reverse_row_groups,
+            pruning_cache: Arc::new(Mutex::new(None)),
         });
         Ok(opener)
     }
