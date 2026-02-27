@@ -346,7 +346,7 @@ pub fn build_join_schema(
 /// the hash table to be built before proceeding.
 ///
 /// Each output partition waits on the same `OnceAsync` before proceeding.
-pub(crate) struct OnceAsync<T> {
+pub struct OnceAsync<T> {
     fut: Mutex<Option<SharedResult<OnceFut<T>>>>,
 }
 
@@ -372,7 +372,7 @@ impl<T: 'static> OnceAsync<T> {
     /// If this is not the first call, will return a [`OnceFut`] referring
     /// to the same future as was returned by the first call - or the same
     /// error if the initial call to `f` failed.
-    pub(crate) fn try_once<F, Fut>(&self, f: F) -> Result<OnceFut<T>>
+    pub fn try_once<F, Fut>(&self, f: F) -> Result<OnceFut<T>>
     where
         F: FnOnce() -> Result<Fut>,
         Fut: Future<Output = Result<T>> + Send + 'static,
@@ -391,7 +391,7 @@ type OnceFutPending<T> = Shared<BoxFuture<'static, SharedResult<Arc<T>>>>;
 /// A [`OnceFut`] represents a shared asynchronous computation, that will be evaluated
 /// once for all [`Clone`]'s, with [`OnceFut::get`] providing a non-consuming interface
 /// to drive the underlying [`Future`] to completion
-pub(crate) struct OnceFut<T> {
+pub struct OnceFut<T> {
     state: OnceFutState<T>,
 }
 
@@ -789,7 +789,7 @@ impl<T: 'static> OnceFut<T> {
     }
 
     /// Get the result of the computation if it is ready, without consuming it
-    pub(crate) fn get(&mut self, cx: &mut Context<'_>) -> Poll<Result<&T>> {
+    pub fn get(&mut self, cx: &mut Context<'_>) -> Poll<Result<&T>> {
         if let OnceFutState::Pending(fut) = &mut self.state {
             let r = ready!(fut.poll_unpin(cx));
             self.state = OnceFutState::Ready(r);
@@ -807,7 +807,7 @@ impl<T: 'static> OnceFut<T> {
     }
 
     /// Get shared reference to the result of the computation if it is ready, without consuming it
-    pub(crate) fn get_shared(&mut self, cx: &mut Context<'_>) -> Poll<Result<Arc<T>>> {
+    pub fn get_shared(&mut self, cx: &mut Context<'_>) -> Poll<Result<Arc<T>>> {
         if let OnceFutState::Pending(fut) = &mut self.state {
             let r = ready!(fut.poll_unpin(cx));
             self.state = OnceFutState::Ready(r);

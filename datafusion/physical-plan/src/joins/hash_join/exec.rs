@@ -460,6 +460,23 @@ impl HashJoinExec {
         })
     }
 
+    pub fn dynamic_filter(&self) -> Option<Arc<DynamicFilterPhysicalExpr>> {
+        self.dynamic_filter.as_ref().map(|f| Arc::clone(&f.filter))
+    }
+
+    pub fn with_dynamic_filter(
+        mut self,
+        dynamic_filter: Option<Arc<DynamicFilterPhysicalExpr>>,
+    ) -> Self {
+        if let Some(dynamic_filter) = dynamic_filter {
+            self.dynamic_filter = Some(HashJoinExecDynamicFilter {
+                filter: dynamic_filter,
+                build_accumulator: OnceLock::new(),
+            });
+        }
+        self
+    }
+
     fn create_dynamic_filter(on: &JoinOn) -> Arc<DynamicFilterPhysicalExpr> {
         // Extract the right-side keys (probe side keys) from the `on` clauses
         // Dynamic filter will be created from build side values (left side) and applied to probe side (right side)
