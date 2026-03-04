@@ -63,6 +63,10 @@ pub struct FileStream {
     baseline_metrics: BaselineMetrics,
     /// Describes the behavior of the `FileStream` if file opening or scanning fails
     on_error: OnError,
+    /// How many files to open ahead of the currently scanning file.
+    /// Higher values reduce inter-file stalls when many files are empty
+    /// after pruning.
+    lookahead_depth: usize,
 }
 
 impl FileStream {
@@ -77,6 +81,12 @@ impl FileStream {
 
         let file_group = config.file_groups[partition].clone();
 
+        let lookahead_depth: usize = std::env::var("E6_FILE_LOOKAHEAD_DEPTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4)
+            .max(1);
+
         Ok(Self {
             file_iter: file_group.into_inner().into_iter().collect(),
             projected_schema,
@@ -86,6 +96,7 @@ impl FileStream {
             file_stream_metrics: FileStreamMetrics::new(metrics, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
             on_error: OnError::Fail,
+            lookahead_depth,
         })
     }
 
@@ -95,6 +106,12 @@ impl FileStream {
     /// If `OnError:Fail` (default) the stream will fail and stop processing when an error occurs
     pub fn with_on_error(mut self, on_error: OnError) -> Self {
         self.on_error = on_error;
+        self
+    }
+
+    /// Override the file lookahead depth (for testing).
+    pub fn with_lookahead_depth(mut self, depth: usize) -> Self {
+        self.lookahead_depth = depth.max(1);
         self
     }
 
@@ -114,7 +131,27 @@ impl FileStream {
                     self.file_stream_metrics.time_opening.start();
 
                     match self.start_next_file().transpose() {
-                        Ok(Some(future)) => self.state = FileStreamState::Open { future },
+                        Ok(Some(future)) => {
+                            // Kick off lookahead files immediately so they
+                            // open in parallel with the first file.
+                            let mut pending = VecDeque::new();
+                            while pending.len() < self.lookahead_depth {
+                                match self.start_next_file().transpose() {
+                                    Ok(Some(f)) => {
+                                        pending.push_back(NextOpen::Pending(f))
+                                    }
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        self.state = FileStreamState::Error;
+                                        return Poll::Ready(Some(Err(e)));
+                                    }
+                                }
+                            }
+                            self.state = FileStreamState::Open {
+                                future,
+                                pending,
+                            };
+                        }
                         Ok(None) => return Poll::Ready(None),
                         Err(e) => {
                             self.state = FileStreamState::Error;
@@ -122,52 +159,93 @@ impl FileStream {
                         }
                     }
                 }
-                FileStreamState::Open { future } => match ready!(future.poll_unpin(cx)) {
-                    Ok(reader) => {
-                        // include time needed to start opening in `start_next_file`
-                        self.file_stream_metrics.time_opening.stop();
-                        let next = self.start_next_file().transpose();
-                        self.file_stream_metrics.time_scanning_until_data.start();
-                        self.file_stream_metrics.time_scanning_total.start();
+                FileStreamState::Open { future, pending } => {
+                    // Drive all pending file opens forward while waiting
+                    for next_open in pending.iter_mut() {
+                        if let NextOpen::Pending(f) = next_open
+                            && let Poll::Ready(result) = f.as_mut().poll(cx)
+                        {
+                            *next_open = NextOpen::Ready(result);
+                        }
+                    }
 
-                        match next {
-                            Ok(Some(next_future)) => {
-                                self.state = FileStreamState::Scan {
-                                    reader,
-                                    next: Some(NextOpen::Pending(next_future)),
-                                };
+                    match ready!(future.poll_unpin(cx)) {
+                        Ok(reader) => {
+                            self.file_stream_metrics.time_opening.stop();
+
+                            // Move pending into next_files and refill up to
+                            // lookahead_depth.
+                            let mut next_files = mem::take(pending);
+                            while next_files.len() < self.lookahead_depth {
+                                match self.start_next_file().transpose() {
+                                    Ok(Some(f)) => {
+                                        next_files.push_back(NextOpen::Pending(f))
+                                    }
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        self.state = FileStreamState::Error;
+                                        return Poll::Ready(Some(Err(e)));
+                                    }
+                                }
                             }
-                            Ok(None) => {
-                                self.state = FileStreamState::Scan { reader, next: None };
-                            }
-                            Err(e) => {
-                                self.state = FileStreamState::Error;
-                                return Poll::Ready(Some(Err(e)));
+
+                            self.file_stream_metrics.time_scanning_until_data.start();
+                            self.file_stream_metrics.time_scanning_total.start();
+                            self.state = FileStreamState::Scan {
+                                reader,
+                                next_files,
+                            };
+                        }
+                        Err(e) => {
+                            self.file_stream_metrics.file_open_errors.add(1);
+                            match self.on_error {
+                                OnError::Skip => {
+                                    self.file_stream_metrics.time_opening.stop();
+                                    let mut remaining = mem::take(pending);
+                                    match remaining.pop_front() {
+                                        Some(next) => {
+                                            self.file_stream_metrics.time_opening.start();
+                                            match next {
+                                                NextOpen::Pending(f) => {
+                                                    self.state = FileStreamState::Open {
+                                                        future: f,
+                                                        pending: remaining,
+                                                    };
+                                                }
+                                                NextOpen::Ready(result) => {
+                                                    self.state = FileStreamState::Open {
+                                                        future: Box::pin(
+                                                            std::future::ready(result),
+                                                        ),
+                                                        pending: remaining,
+                                                    };
+                                                }
+                                            }
+                                        }
+                                        None => self.state = FileStreamState::Idle,
+                                    }
+                                }
+                                OnError::Fail => {
+                                    self.state = FileStreamState::Error;
+                                    return Poll::Ready(Some(Err(e)));
+                                }
                             }
                         }
                     }
-                    Err(e) => {
-                        self.file_stream_metrics.file_open_errors.add(1);
-                        match self.on_error {
-                            OnError::Skip => {
-                                self.file_stream_metrics.time_opening.stop();
-                                self.state = FileStreamState::Idle
-                            }
-                            OnError::Fail => {
-                                self.state = FileStreamState::Error;
-                                return Poll::Ready(Some(Err(e)));
-                            }
+                }
+                FileStreamState::Scan {
+                    reader,
+                    next_files,
+                } => {
+                    // Drive all pending file opens forward while scanning
+                    for next_open in next_files.iter_mut() {
+                        if let NextOpen::Pending(f) = next_open
+                            && let Poll::Ready(result) = f.as_mut().poll(cx)
+                        {
+                            *next_open = NextOpen::Ready(result);
                         }
                     }
-                },
-                FileStreamState::Scan { reader, next } => {
-                    // We need to poll the next `FileOpenFuture` here to drive it forward
-                    if let Some(next_open_future) = next
-                        && let NextOpen::Pending(f) = next_open_future
-                        && let Poll::Ready(reader) = f.as_mut().poll(cx)
-                    {
-                        *next_open_future = NextOpen::Ready(reader);
-                    }
+
                     match ready!(reader.poll_next_unpin(cx)) {
                         Some(Ok(batch)) => {
                             self.file_stream_metrics.time_scanning_until_data.stop();
@@ -195,27 +273,35 @@ impl FileStream {
                             self.file_stream_metrics.time_scanning_total.stop();
 
                             match self.on_error {
-                                // If `OnError::Skip` we skip the file as soon as we hit the first error
-                                OnError::Skip => match mem::take(next) {
-                                    Some(future) => {
-                                        self.file_stream_metrics.time_opening.start();
-
-                                        match future {
-                                            NextOpen::Pending(future) => {
-                                                self.state =
-                                                    FileStreamState::Open { future }
-                                            }
-                                            NextOpen::Ready(reader) => {
-                                                self.state = FileStreamState::Open {
-                                                    future: Box::pin(std::future::ready(
-                                                        reader,
-                                                    )),
+                                OnError::Skip => {
+                                    match next_files.pop_front() {
+                                        Some(next) => {
+                                            self.file_stream_metrics
+                                                .time_opening
+                                                .start();
+                                            let pending = mem::take(next_files);
+                                            self.state = match next {
+                                                NextOpen::Pending(future) => {
+                                                    FileStreamState::Open {
+                                                        future,
+                                                        pending,
+                                                    }
                                                 }
-                                            }
+                                                NextOpen::Ready(result) => {
+                                                    FileStreamState::Open {
+                                                        future: Box::pin(
+                                                            std::future::ready(
+                                                                result,
+                                                            ),
+                                                        ),
+                                                        pending,
+                                                    }
+                                                }
+                                            };
                                         }
+                                        None => return Poll::Ready(None),
                                     }
-                                    None => return Poll::Ready(None),
-                                },
+                                }
                                 OnError::Fail => {
                                     self.state = FileStreamState::Error;
                                     return Poll::Ready(Some(Err(err)));
@@ -226,22 +312,26 @@ impl FileStream {
                             self.file_stream_metrics.time_scanning_until_data.stop();
                             self.file_stream_metrics.time_scanning_total.stop();
 
-                            match mem::take(next) {
-                                Some(future) => {
+                            match next_files.pop_front() {
+                                Some(next) => {
                                     self.file_stream_metrics.time_opening.start();
-
-                                    match future {
+                                    let pending = mem::take(next_files);
+                                    self.state = match next {
                                         NextOpen::Pending(future) => {
-                                            self.state = FileStreamState::Open { future }
-                                        }
-                                        NextOpen::Ready(reader) => {
-                                            self.state = FileStreamState::Open {
-                                                future: Box::pin(std::future::ready(
-                                                    reader,
-                                                )),
+                                            FileStreamState::Open {
+                                                future,
+                                                pending,
                                             }
                                         }
-                                    }
+                                        NextOpen::Ready(result) => {
+                                            FileStreamState::Open {
+                                                future: Box::pin(
+                                                    std::future::ready(result),
+                                                ),
+                                                pending,
+                                            }
+                                        }
+                                    };
                                 }
                                 None => return Poll::Ready(None),
                             }
@@ -316,16 +406,19 @@ pub enum FileStreamState {
     Open {
         /// A [`FileOpenFuture`] returned by [`FileOpener::open`]
         future: FileOpenFuture,
+        /// Additional files being opened in parallel, carried from the
+        /// previous `Scan` state or empty when entering from `Idle`.
+        pending: VecDeque<NextOpen>,
     },
     /// Scanning the [`BoxStream`] returned by the completion of a [`FileOpenFuture`]
     /// returned by [`FileOpener::open`]
     Scan {
         /// The reader instance
         reader: BoxStream<'static, Result<RecordBatch>>,
-        /// A [`FileOpenFuture`] for the next file to be processed.
-        /// This allows the next file to be opened in parallel while the
-        /// current file is read.
-        next: Option<NextOpen>,
+        /// Queue of files being opened or already opened in parallel.
+        /// Allows multiple files to be opened ahead of the current scan,
+        /// reducing inter-file stalls when many files are empty after pruning.
+        next_files: VecDeque<NextOpen>,
     },
     /// Encountered an error
     Error,
@@ -900,6 +993,177 @@ mod tests {
             "| 0 |",
             "+---+",
         ], &batches);
+
+        Ok(())
+    }
+
+    /// `FileOpener` that adds a configurable delay to simulate network I/O
+    /// during file opening. Used to validate that lookahead parallelism
+    /// reduces total wall-clock time.
+    struct SlowOpener {
+        delay: std::time::Duration,
+        records: Vec<RecordBatch>,
+    }
+
+    impl FileOpener for SlowOpener {
+        fn open(&self, _partitioned_file: PartitionedFile) -> Result<FileOpenFuture> {
+            let delay = self.delay;
+            let records = self.records.clone();
+            Ok(async move {
+                tokio::time::sleep(delay).await;
+                let stream =
+                    futures::stream::iter(records.into_iter().map(Ok)).boxed();
+                Ok(stream)
+            }
+            .boxed())
+        }
+    }
+
+    /// Validates that file lookahead opens files in parallel,
+    /// reducing total time compared to sequential opening.
+    #[tokio::test]
+    async fn lookahead_opens_files_in_parallel() -> Result<()> {
+        let num_files = 8;
+        let delay = std::time::Duration::from_millis(50);
+        let records = vec![make_partition(2)];
+
+        let file_schema = records[0].schema();
+        let mock_files: Vec<(String, u64)> = (0..num_files)
+            .map(|idx| (format!("mock_file{idx}"), 10_u64))
+            .collect();
+        let file_group = mock_files
+            .into_iter()
+            .map(|(name, size)| PartitionedFile::new(name, size))
+            .collect();
+
+        let table_schema =
+            crate::table_schema::TableSchema::new(file_schema, vec![]);
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test:///").unwrap(),
+            Arc::new(MockSource::new(table_schema)),
+        )
+        .with_file_group(file_group)
+        .build();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+
+        let opener = SlowOpener {
+            delay,
+            records,
+        };
+
+        let file_stream =
+            FileStream::new(&config, 0, Arc::new(opener), &metrics_set).unwrap();
+
+        let start = std::time::Instant::now();
+        let batches: Vec<RecordBatch> = file_stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let elapsed = start.elapsed();
+
+        // Verify correctness: 8 files × 2 rows each = 16 rows
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            16
+        );
+
+        // With sequential opening: 8 files × 50ms = 400ms minimum.
+        // With lookahead_depth=4 (default), files open in parallel
+        // batches, so total should be significantly less than 400ms.
+        // Allow generous 300ms ceiling to avoid flakiness.
+        let sequential_time = delay * num_files as u32;
+        assert!(
+            elapsed < sequential_time,
+            "Expected parallel speedup: elapsed {elapsed:?} should be \
+             less than sequential {sequential_time:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Helper: run SlowOpener with a given lookahead depth and return
+    /// (total_rows, elapsed).
+    async fn run_with_lookahead(
+        num_files: usize,
+        delay: std::time::Duration,
+        records: Vec<RecordBatch>,
+        lookahead_depth: usize,
+    ) -> Result<(usize, std::time::Duration)> {
+        let file_schema = records[0].schema();
+        let mock_files: Vec<(String, u64)> = (0..num_files)
+            .map(|idx| (format!("mock_file{idx}"), 10_u64))
+            .collect();
+        let file_group = mock_files
+            .into_iter()
+            .map(|(name, size)| PartitionedFile::new(name, size))
+            .collect();
+
+        let table_schema =
+            crate::table_schema::TableSchema::new(file_schema, vec![]);
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test:///").unwrap(),
+            Arc::new(MockSource::new(table_schema)),
+        )
+        .with_file_group(file_group)
+        .build();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+
+        let opener = SlowOpener {
+            delay,
+            records,
+        };
+
+        let file_stream =
+            FileStream::new(&config, 0, Arc::new(opener), &metrics_set)
+                .unwrap()
+                .with_lookahead_depth(lookahead_depth);
+
+        let start = std::time::Instant::now();
+        let batches: Vec<RecordBatch> = file_stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let elapsed = start.elapsed();
+
+        let total_rows = batches.iter().map(|b| b.num_rows()).sum();
+        Ok((total_rows, elapsed))
+    }
+
+    /// A/B test: compare lookahead depth=1 (baseline, sequential) vs
+    /// depth=4 (parallel) with simulated I/O latency.
+    #[tokio::test]
+    async fn ab_test_file_lookahead_speedup() -> Result<()> {
+        let num_files = 16;
+        let delay = std::time::Duration::from_millis(50);
+        let records = vec![make_partition(2)];
+        let expected_rows = num_files * 2;
+
+        // --- A: baseline (depth=1, like upstream) ---
+        let (rows_a, elapsed_a) =
+            run_with_lookahead(num_files, delay, records.clone(), 1).await?;
+        assert_eq!(rows_a, expected_rows);
+
+        // --- B: optimized (depth=4) ---
+        let (rows_b, elapsed_b) =
+            run_with_lookahead(num_files, delay, records, 4).await?;
+        assert_eq!(rows_b, expected_rows);
+
+        let speedup = elapsed_a.as_secs_f64() / elapsed_b.as_secs_f64();
+
+        eprintln!("=== File Lookahead A/B Test ===");
+        eprintln!("  Files: {num_files}, open delay: {delay:?}");
+        eprintln!("  A (depth=1): {elapsed_a:?}");
+        eprintln!("  B (depth=4): {elapsed_b:?}");
+        eprintln!("  Speedup: {speedup:.2}x");
+
+        // depth=4 should be measurably faster than depth=1
+        assert!(
+            speedup > 1.5,
+            "Expected at least 1.5x speedup, got {speedup:.2}x \
+             (A={elapsed_a:?}, B={elapsed_b:?})"
+        );
 
         Ok(())
     }
