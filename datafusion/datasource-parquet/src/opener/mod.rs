@@ -774,7 +774,16 @@ impl FileOpener for ParquetOpener {
 
             // Wrap with row group prefetching: overlap I/O for the next row
             // group with CPU decoding of the current one.
-            let stream = prefetch::EagerRowGroupPrefetchStream::new(stream, 1);
+            // E6_PREFETCH_DEPTH controls how many row groups to buffer ahead
+            // (default: 1). Higher values use more memory but can hide deeper
+            // I/O latency.
+            let prefetch_depth: usize = std::env::var("E6_PREFETCH_DEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1)
+                .max(1);
+            let stream =
+                prefetch::EagerRowGroupPrefetchStream::new(stream, prefetch_depth);
 
             let stream = if let Some(deletion_vector) = deletion_vector_opt {
                 let deletion_vector: Arc<DeletionVectorHolder> =
