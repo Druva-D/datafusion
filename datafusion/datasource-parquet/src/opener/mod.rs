@@ -17,6 +17,8 @@
 
 //! [`ParquetOpener`] for opening Parquet files
 
+mod prefetch;
+
 use crate::deletion_vector::{DVWrappedStream, DeletionVectorHolder};
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::row_filter::{self, FilterCandidateBuilder};
@@ -62,7 +64,7 @@ use crate::sort::reverse_row_selection;
 use datafusion_common::config::EncryptionFactoryOptions;
 #[cfg(feature = "parquet_encryption")]
 use datafusion_execution::parquet_encryption::EncryptionFactory;
-use futures::{Stream, StreamExt, TryStreamExt, ready};
+use futures::{Stream, StreamExt, ready};
 use log::debug;
 use parquet::arrow::RowNumber;
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
@@ -770,7 +772,18 @@ impl FileOpener for ParquetOpener {
 
             let stream_schema = Arc::clone(stream.schema());
 
-            let stream = stream.map_err(DataFusionError::from);
+            // Wrap with row group prefetching: overlap I/O for the next row
+            // group with CPU decoding of the current one.
+            // E6_PREFETCH_DEPTH controls how many row groups to buffer ahead
+            // (default: 1). Higher values use more memory but can hide deeper
+            // I/O latency.
+            let prefetch_depth: usize = std::env::var("E6_PREFETCH_DEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1)
+                .max(1);
+            let stream =
+                prefetch::EagerRowGroupPrefetchStream::new(stream, prefetch_depth);
 
             let stream = if let Some(deletion_vector) = deletion_vector_opt {
                 let deletion_vector: Arc<DeletionVectorHolder> =
