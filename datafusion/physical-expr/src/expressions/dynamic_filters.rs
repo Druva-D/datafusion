@@ -304,6 +304,12 @@ impl DynamicFilterPhysicalExpr {
             .await;
     }
 
+    /// (e6data-added) Opaque identity that is stable across remapping.
+    /// Two filters that share the same source will return the same value.
+    pub fn source_id(&self) -> usize {
+        Arc::as_ptr(&self.inner) as *const () as usize
+    }
+
     /// Check if this dynamic filter is being actively used by any consumers.
     ///
     /// Returns `true` if there are references beyond the producer (e.g., the HashJoinExec
