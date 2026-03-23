@@ -236,18 +236,21 @@ where
 }
 
 /// The size, in number of entries, of the initial hash table
-const INITIAL_MAP_CAPACITY: usize = 128;
+const INITIAL_MAP_CAPACITY: usize = 0;
 /// The initial size, in bytes, of the string data
-pub const INITIAL_BUFFER_CAPACITY: usize = 8 * 1024;
+pub const INITIAL_BUFFER_CAPACITY: usize = 0;
 impl<O: OffsetSizeTrait, V> ArrowBytesMap<O, V>
 where
     V: Debug + PartialEq + Eq + Clone + Copy + Default,
 {
     pub fn new(output_type: OutputType) -> Self {
+        let map =
+            hashbrown::hash_table::HashTable::with_capacity(INITIAL_MAP_CAPACITY);
+        let map_size = map.capacity() * size_of::<Entry<O, V>>();
         Self {
             output_type,
-            map: hashbrown::hash_table::HashTable::with_capacity(INITIAL_MAP_CAPACITY),
-            map_size: 0,
+            map,
+            map_size,
             buffer: BufferBuilder::new(INITIAL_BUFFER_CAPACITY),
             offsets: vec![O::default()], // first offset is always 0
             random_state: RandomState::new(),
