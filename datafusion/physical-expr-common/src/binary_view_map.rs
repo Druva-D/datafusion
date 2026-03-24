@@ -138,7 +138,9 @@ where
 }
 
 /// The size, in number of entries, of the initial hash table
-const INITIAL_MAP_CAPACITY: usize = 0;
+const INITIAL_MAP_CAPACITY: usize = 16;
+/// The initial size, in bytes, of the builder data
+const INITIAL_BUFFER_CAPACITY: usize = 16;
 
 impl<V> ArrowBytesViewMap<V>
 where
@@ -151,7 +153,7 @@ where
             output_type,
             map,
             map_size,
-            builder: GenericByteViewBuilder::with_capacity(0),
+            builder: GenericByteViewBuilder::with_capacity(INITIAL_BUFFER_CAPACITY),
             random_state: RandomState::new(),
             hashes_buffer: vec![],
             null: None,
