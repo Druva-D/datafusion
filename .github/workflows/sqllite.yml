@@ -32,8 +32,9 @@ jobs:
         id: get-arrow-branch
         run: |
           set -eo pipefail
-          ARROW_BRANCH=$(curl -fsS -H "Authorization: token ${{ secrets.E6_ARROW_RS_PAT }}" \
-            "https://raw.githubusercontent.com/e6data/e6-native-executor/main/.gitmodules" \
+          ARROW_BRANCH=$(curl -fsS -H "Authorization: Bearer ${{ secrets.E6_ARROW_RS_PAT }}" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/e6data/e6-native-executor/contents/.gitmodules?ref=main" \
             | grep -A3 '\[submodule "e6-arrow-rs"\]' | grep 'branch' | sed 's/.*= *//')
           echo "branch=$ARROW_BRANCH" >> $GITHUB_OUTPUT
         working-directory: .
