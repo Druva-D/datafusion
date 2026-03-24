@@ -27,6 +27,7 @@ use arrow::datatypes::{BinaryViewType, ByteViewType, DataType, StringViewType};
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::utils::proxy::{HashTableAllocExt, VecAllocExt};
 use std::fmt::Debug;
+use std::mem::size_of;
 use std::sync::Arc;
 
 /// HashSet optimized for storing string or binary values that can produce that
@@ -137,18 +138,22 @@ where
 }
 
 /// The size, in number of entries, of the initial hash table
-const INITIAL_MAP_CAPACITY: usize = 512;
+const INITIAL_MAP_CAPACITY: usize = 16;
+/// The initial size, in bytes, of the builder data
+const INITIAL_BUFFER_CAPACITY: usize = 16;
 
 impl<V> ArrowBytesViewMap<V>
 where
     V: Debug + PartialEq + Eq + Clone + Copy + Default,
 {
     pub fn new(output_type: OutputType) -> Self {
+        let map = hashbrown::hash_table::HashTable::with_capacity(INITIAL_MAP_CAPACITY);
+        let map_size = map.capacity() * size_of::<Entry<V>>();
         Self {
             output_type,
-            map: hashbrown::hash_table::HashTable::with_capacity(INITIAL_MAP_CAPACITY),
-            map_size: 0,
-            builder: GenericByteViewBuilder::new(),
+            map,
+            map_size,
+            builder: GenericByteViewBuilder::with_capacity(INITIAL_BUFFER_CAPACITY),
             random_state: RandomState::new(),
             hashes_buffer: vec![],
             null: None,
