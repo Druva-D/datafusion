@@ -244,8 +244,7 @@ where
     V: Debug + PartialEq + Eq + Clone + Copy + Default,
 {
     pub fn new(output_type: OutputType) -> Self {
-        let map =
-            hashbrown::hash_table::HashTable::with_capacity(INITIAL_MAP_CAPACITY);
+        let map = hashbrown::hash_table::HashTable::with_capacity(INITIAL_MAP_CAPACITY);
         let map_size = map.capacity() * size_of::<Entry<O, V>>();
         Self {
             output_type,
