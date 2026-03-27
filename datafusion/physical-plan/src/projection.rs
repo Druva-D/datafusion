@@ -1743,4 +1743,178 @@ mod tests {
 
         Ok(())
     }
+
+    /// Helper: builds a ProjectionExec with duplicate "id" column names,
+    /// simulating the plan structure above a LEFT JOIN where both sides
+    /// have an `id` column.
+    ///
+    ///   input (join output): [left_id, left_val, right_id]
+    ///   projection output:   [right_id@2 as id, left_val@1 as val, left_id@0 as id]
+    ///
+    /// Output column 0 ("id") comes from right_id@2.
+    /// Output column 2 ("id") comes from left_id@0.
+    fn make_duplicate_name_projection() -> Result<ProjectionExec> {
+        let input_schema = Schema::new(vec![
+            Field::new("left_id", DataType::Int32, true),
+            Field::new("left_val", DataType::Utf8, true),
+            Field::new("right_id", DataType::Int32, true),
+        ]);
+        let input = Arc::new(StatisticsExec::new(
+            Statistics {
+                column_statistics: vec![Default::default(); input_schema.fields().len()],
+                ..Default::default()
+            },
+            input_schema,
+        ));
+
+        ProjectionExec::try_new(
+            vec![
+                ProjectionExpr {
+                    expr: Arc::new(Column::new("right_id", 2)),
+                    alias: "id".to_string(),
+                },
+                ProjectionExpr {
+                    expr: Arc::new(Column::new("left_val", 1)),
+                    alias: "val".to_string(),
+                },
+                ProjectionExpr {
+                    expr: Arc::new(Column::new("left_id", 0)),
+                    alias: "id".to_string(),
+                },
+            ],
+            input,
+        )
+    }
+
+    /// Regression test for Fix 1 (collect_reverse_alias).
+    ///
+    /// Filter references the FIRST occurrence of a duplicate name: `id@0`.
+    /// Without Fix 1, collect_reverse_alias uses column_with_name() which
+    /// always returns index 0 for "id". The second projection entry
+    /// (left_id@0 as id) overwrites the first (right_id@2 as id) in the
+    /// HashMap, so id@0 incorrectly maps to left_id@0 instead of right_id@2.
+    ///
+    /// This is the exact scenario from the production anti-join query where
+    /// `txn.order_id IS NULL` was pushed into ec_sessions scan.
+    #[test]
+    fn test_filter_pushdown_duplicate_names_first_occurrence() -> Result<()> {
+        let projection = make_duplicate_name_projection()?;
+
+        // id@0 IS NULL — checks output column 0, sourced from right_id@2
+        let filter = Arc::new(
+            datafusion_physical_expr::expressions::IsNullExpr::new(Arc::new(
+                Column::new("id", 0),
+            )),
+        ) as Arc<dyn PhysicalExpr>;
+
+        let description = projection.gather_filters_for_pushdown(
+            FilterPushdownPhase::Pre,
+            vec![filter],
+            &ConfigOptions::default(),
+        )?;
+
+        let pushed = &description.parent_filters()[0];
+        assert_eq!(pushed.len(), 1);
+        assert!(
+            matches!(pushed[0].discriminant, PushedDown::Yes),
+            "filter on first 'id' column should be pushable"
+        );
+        assert_eq!(
+            format!("{}", pushed[0].predicate),
+            "right_id@2 IS NULL",
+            "id@0 must remap to right_id@2, not left_id@0"
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for Fix 2 (remove FilterRemapper::try_remap).
+    ///
+    /// Filter references the SECOND occurrence of a duplicate name: `id@2`.
+    /// Even with Fix 1 (correct alias map), the old try_remap step uses
+    /// index_of("id") which returns 0 (first match), silently rewriting
+    /// id@2 to id@0 before the alias map lookup. The lookup then finds
+    /// the entry for output column 0 (right_id@2) instead of output
+    /// column 2 (left_id@0).
+    ///
+    /// Fix 2 removes try_remap and validates directly against the alias
+    /// map using exact (name, index) keys, so id@2 stays as id@2 and
+    /// correctly maps to left_id@0.
+    #[test]
+    fn test_filter_pushdown_duplicate_names_second_occurrence() -> Result<()> {
+        let projection = make_duplicate_name_projection()?;
+
+        // id@2 IS NULL — checks output column 2, sourced from left_id@0
+        let filter = Arc::new(
+            datafusion_physical_expr::expressions::IsNullExpr::new(Arc::new(
+                Column::new("id", 2),
+            )),
+        ) as Arc<dyn PhysicalExpr>;
+
+        let description = projection.gather_filters_for_pushdown(
+            FilterPushdownPhase::Pre,
+            vec![filter],
+            &ConfigOptions::default(),
+        )?;
+
+        let pushed = &description.parent_filters()[0];
+        assert_eq!(pushed.len(), 1);
+        assert!(
+            matches!(pushed[0].discriminant, PushedDown::Yes),
+            "filter on second 'id' column should be pushable"
+        );
+        assert_eq!(
+            format!("{}", pushed[0].predicate),
+            "left_id@0 IS NULL",
+            "id@2 must remap to left_id@0, not right_id@2"
+        );
+
+        Ok(())
+    }
+
+    /// Combined regression test: both filters pushed through simultaneously.
+    ///
+    /// Ensures Fix 1 and Fix 2 work together — each duplicate-named column
+    /// independently remaps to its correct source expression.
+    #[test]
+    fn test_filter_pushdown_duplicate_names_both_filters() -> Result<()> {
+        let projection = make_duplicate_name_projection()?;
+
+        // Push both filters at once
+        let filter_first = Arc::new(
+            datafusion_physical_expr::expressions::IsNullExpr::new(Arc::new(
+                Column::new("id", 0),
+            )),
+        ) as Arc<dyn PhysicalExpr>;
+        let filter_second = Arc::new(
+            datafusion_physical_expr::expressions::IsNullExpr::new(Arc::new(
+                Column::new("id", 2),
+            )),
+        ) as Arc<dyn PhysicalExpr>;
+
+        let description = projection.gather_filters_for_pushdown(
+            FilterPushdownPhase::Pre,
+            vec![filter_first, filter_second],
+            &ConfigOptions::default(),
+        )?;
+
+        let pushed = &description.parent_filters()[0];
+        assert_eq!(pushed.len(), 2);
+
+        assert!(matches!(pushed[0].discriminant, PushedDown::Yes));
+        assert!(matches!(pushed[1].discriminant, PushedDown::Yes));
+
+        assert_eq!(
+            format!("{}", pushed[0].predicate),
+            "right_id@2 IS NULL",
+            "id@0 → right_id@2"
+        );
+        assert_eq!(
+            format!("{}", pushed[1].predicate),
+            "left_id@0 IS NULL",
+            "id@2 → left_id@0"
+        );
+
+        Ok(())
+    }
 }
