@@ -481,6 +481,7 @@ impl FileFormat for ParquetFormat {
             source = source.with_metadata_size_hint(metadata_size_hint)
         }
 
+        source.with_config_options(Arc::new(state.config_options().clone()));
         source = self.set_source_encryption_factory(source, state)?;
 
         let conf = FileScanConfigBuilder::from(conf)

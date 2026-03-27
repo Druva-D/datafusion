@@ -657,6 +657,8 @@ impl FileOpener for ParquetOpener {
                             builder = builder.with_row_filter(row_filter);
                         }
                     }
+                } else {
+                    log::info!("config_options_opt is None during filter pushdown");
                 }
             };
             if force_filter_selections {

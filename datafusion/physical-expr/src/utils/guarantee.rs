@@ -268,18 +268,22 @@ impl LiteralGuarantee {
 
 impl Display for LiteralGuarantee {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let mut sorted_literals: String = self
-            .literals
-            .iter()
-            .map(|lit| lit.to_string())
-            .take(10)
-            .collect::<Vec<String>>()
-            .join(", ");
-        if self.literals.len() > 10 {
-            sorted_literals
-                .push_str(format!("...+{} elements", self.literals.len() - 10).as_str());
-        }
-        // sorted_literals.sort();
+        let sorted_literals = if self.literals.len() <= 10 {
+            let mut strs: Vec<String> =
+                self.literals.iter().map(|lit| lit.to_string()).collect();
+            strs.sort();
+            strs.join(", ")
+        } else {
+            let mut s: String = self
+                .literals
+                .iter()
+                .take(10)
+                .map(|lit| lit.to_string())
+                .collect::<Vec<String>>()
+                .join(", ");
+            s.push_str(&format!("...+{} elements", self.literals.len() - 10));
+            s
+        };
         match self.guarantee {
             Guarantee::In => write!(f, "{} in ({})", self.column.name, sorted_literals),
             Guarantee::NotIn => {
