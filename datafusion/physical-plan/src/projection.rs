@@ -200,18 +200,14 @@ impl ProjectionExec {
         &self,
     ) -> Result<datafusion_common::HashMap<Column, Arc<dyn PhysicalExpr>>> {
         let mut alias_map = datafusion_common::HashMap::new();
-        for projection in self.projection_expr().iter() {
-            let (aliased_index, _output_field) = self
-                .projector
-                .output_schema()
-                .column_with_name(&projection.alias)
-                .ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "Expr {} with alias {} not found in output schema",
-                        projection.expr, projection.alias
-                    ))
-                })?;
-            let aliased_col = Column::new(&projection.alias, aliased_index);
+        // Use the enumerate index directly rather than `column_with_name`,
+        // because the output schema columns are ordered identically to the
+        // projection expressions.  `column_with_name` returns the *first*
+        // column with a given name, which silently produces duplicate HashMap
+        // keys (and overwrites earlier entries) when the projection contains
+        // same-named columns from different join sides.
+        for (idx, projection) in self.projection_expr().iter().enumerate() {
+            let aliased_col = Column::new(&projection.alias, idx);
             alias_map.insert(aliased_col, Arc::clone(&projection.expr));
         }
         Ok(alias_map)
