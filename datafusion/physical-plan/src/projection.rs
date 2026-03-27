@@ -50,11 +50,6 @@ use datafusion_common::{DataFusionError, JoinSide, Result, internal_err};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::projection::Projector;
-use datafusion_physical_expr::utils::collect_columns;
-use datafusion_physical_expr_common::physical_expr::{PhysicalExprRef, fmt_sql};
-use datafusion_physical_expr_common::sort_expr::{
-    LexOrdering, LexRequirement, PhysicalSortExpr,
-};
 // Re-exported from datafusion-physical-expr for backwards compatibility
 // We recommend updating your imports to use datafusion-physical-expr directly
 pub use datafusion_physical_expr::projection::{
