@@ -29,7 +29,7 @@ use super::{
 use crate::execution_plan::CardinalityEffect;
 use crate::filter_pushdown::{
     ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
-    FilterPushdownPropagation, FilterRemapper, PushedDownPredicate,
+    FilterPushdownPropagation, PushedDownPredicate,
 };
 use crate::joins::utils::{ColumnIndex, JoinFilter, JoinOn, JoinOnRef};
 use crate::util::PhysicalColumnRewriter;
@@ -369,16 +369,22 @@ impl ExecutionPlan for ProjectionExec {
     ) -> Result<FilterDescription> {
         // expand alias column to original expr in parent filters
         let invert_alias_map = self.collect_reverse_alias()?;
-        let output_schema = self.schema();
-        let remapper = FilterRemapper::new(output_schema);
         let mut child_parent_filters = Vec::with_capacity(parent_filters.len());
 
         for filter in parent_filters {
-            // Check that column exists in child, then reassign column indices to match child schema
-            if let Some(reassigned) = remapper.try_remap(&filter)? {
-                // rewrite filter expression using invert alias map
+            // Validate that every column referenced by the filter exists in
+            // the reverse-alias map (keyed by exact (name, index) pair).
+            // We must NOT use FilterRemapper::try_remap here because its
+            // index_of lookup returns the *first* column with a given name,
+            // which silently re-targets the filter to the wrong column when
+            // the projection output contains duplicate column names (e.g.
+            // after a join where both sides have an `id` column).
+            let columns = collect_columns(&filter);
+            let all_in_alias_map =
+                columns.iter().all(|col| invert_alias_map.contains_key(col));
+            if all_in_alias_map {
                 let mut rewriter = PhysicalColumnRewriter::new(&invert_alias_map);
-                let rewritten = reassigned.rewrite(&mut rewriter)?.data;
+                let rewritten = filter.rewrite(&mut rewriter)?.data;
                 child_parent_filters.push(PushedDownPredicate::supported(rewritten));
             } else {
                 child_parent_filters.push(PushedDownPredicate::unsupported(filter));
