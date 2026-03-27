@@ -60,6 +60,11 @@ use datafusion_physical_expr_common::sort_expr::{
 pub use datafusion_physical_expr::projection::{
     ProjectionExpr, ProjectionExprs, update_expr,
 };
+use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr_common::physical_expr::{PhysicalExprRef, fmt_sql};
+use datafusion_physical_expr_common::sort_expr::{
+    LexOrdering, LexRequirement, PhysicalSortExpr,
+};
 
 use futures::stream::{Stream, StreamExt};
 use log::trace;
