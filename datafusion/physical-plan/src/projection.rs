@@ -1801,11 +1801,9 @@ mod tests {
         let projection = make_duplicate_name_projection()?;
 
         // id@0 IS NULL — checks output column 0, sourced from right_id@2
-        let filter = Arc::new(
-            datafusion_physical_expr::expressions::IsNullExpr::new(Arc::new(
-                Column::new("id", 0),
-            )),
-        ) as Arc<dyn PhysicalExpr>;
+        let filter = Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
+            Arc::new(Column::new("id", 0)),
+        )) as Arc<dyn PhysicalExpr>;
 
         let description = projection.gather_filters_for_pushdown(
             FilterPushdownPhase::Pre,
@@ -1845,11 +1843,9 @@ mod tests {
         let projection = make_duplicate_name_projection()?;
 
         // id@2 IS NULL — checks output column 2, sourced from left_id@0
-        let filter = Arc::new(
-            datafusion_physical_expr::expressions::IsNullExpr::new(Arc::new(
-                Column::new("id", 2),
-            )),
-        ) as Arc<dyn PhysicalExpr>;
+        let filter = Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
+            Arc::new(Column::new("id", 2)),
+        )) as Arc<dyn PhysicalExpr>;
 
         let description = projection.gather_filters_for_pushdown(
             FilterPushdownPhase::Pre,
@@ -1881,16 +1877,14 @@ mod tests {
         let projection = make_duplicate_name_projection()?;
 
         // Push both filters at once
-        let filter_first = Arc::new(
-            datafusion_physical_expr::expressions::IsNullExpr::new(Arc::new(
-                Column::new("id", 0),
-            )),
-        ) as Arc<dyn PhysicalExpr>;
-        let filter_second = Arc::new(
-            datafusion_physical_expr::expressions::IsNullExpr::new(Arc::new(
-                Column::new("id", 2),
-            )),
-        ) as Arc<dyn PhysicalExpr>;
+        let filter_first =
+            Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
+                Arc::new(Column::new("id", 0)),
+            )) as Arc<dyn PhysicalExpr>;
+        let filter_second =
+            Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
+                Arc::new(Column::new("id", 2)),
+            )) as Arc<dyn PhysicalExpr>;
 
         let description = projection.gather_filters_for_pushdown(
             FilterPushdownPhase::Pre,
