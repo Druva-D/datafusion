@@ -146,6 +146,18 @@ pub trait FileMetadataCache:
 
     /// Retrieves the information about the entries currently cached.
     fn list_entries(&self) -> HashMap<Path, FileMetadataCacheEntry>;
+
+    /// Returns the total number of successful cache lookups (hits) since this cache was created.
+    /// Default implementation returns 0; override for caches that track this metric.
+    fn hit_count(&self) -> usize {
+        0
+    }
+
+    /// Returns the total number of cache lookups that found no valid entry (misses) since this cache was created.
+    /// Default implementation returns 0; override for caches that track this metric.
+    fn miss_count(&self) -> usize {
+        0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

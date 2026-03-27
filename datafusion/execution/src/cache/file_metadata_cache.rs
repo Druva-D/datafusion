@@ -17,7 +17,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use object_store::{ObjectMeta, path::Path};
@@ -168,6 +171,10 @@ impl DefaultFilesMetadataCacheState {
 pub struct DefaultFilesMetadataCache {
     // the state is wrapped in a Mutex to ensure the operations are atomic
     state: Mutex<DefaultFilesMetadataCacheState>,
+    /// Total number of successful cache lookups (entry found and still valid).
+    total_hits: AtomicUsize,
+    /// Total number of cache lookups that did not find a valid entry.
+    total_misses: AtomicUsize,
 }
 
 impl DefaultFilesMetadataCache {
@@ -179,6 +186,8 @@ impl DefaultFilesMetadataCache {
     pub fn new(memory_limit: usize) -> Self {
         Self {
             state: Mutex::new(DefaultFilesMetadataCacheState::new(memory_limit)),
+            total_hits: AtomicUsize::new(0),
+            total_misses: AtomicUsize::new(0),
         }
     }
 
@@ -186,6 +195,16 @@ impl DefaultFilesMetadataCache {
     pub fn memory_used(&self) -> usize {
         let state = self.state.lock().unwrap();
         state.memory_used
+    }
+
+    /// Returns the total number of successful cache lookups since this cache was created.
+    pub fn hit_count(&self) -> usize {
+        self.total_hits.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total number of cache lookups that found no valid entry since this cache was created.
+    pub fn miss_count(&self) -> usize {
+        self.total_misses.load(Ordering::Relaxed)
     }
 }
 
@@ -199,6 +218,14 @@ impl FileMetadataCache for DefaultFilesMetadataCache {
         let mut state = self.state.lock().unwrap();
         state.memory_limit = limit;
         state.evict_entries();
+    }
+
+    fn hit_count(&self) -> usize {
+        self.hit_count()
+    }
+
+    fn miss_count(&self) -> usize {
+        self.miss_count()
     }
 
     fn list_entries(&self) -> HashMap<Path, FileMetadataCacheEntry> {
@@ -226,7 +253,13 @@ impl CacheAccessor<ObjectMeta, Arc<dyn FileMetadata>> for DefaultFilesMetadataCa
 
     fn get(&self, k: &ObjectMeta) -> Option<Arc<dyn FileMetadata>> {
         let mut state = self.state.lock().unwrap();
-        state.get(k)
+        let result = state.get(k);
+        if result.is_some() {
+            self.total_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.total_misses.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     fn get_with_extra(

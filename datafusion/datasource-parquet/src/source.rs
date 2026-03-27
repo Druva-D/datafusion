@@ -49,8 +49,8 @@ use datafusion_physical_plan::filter_pushdown::PushedDown;
 use datafusion_physical_plan::filter_pushdown::{
     FilterPushdownPropagation, PushedDownPredicate,
 };
-use datafusion_physical_plan::metrics::Count;
-use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_execution::cache::cache_manager::FileMetadataCache;
+use datafusion_physical_plan::metrics::{Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricType};
 
 #[cfg(feature = "parquet_encryption")]
 use datafusion_execution::parquet_encryption::EncryptionFactory;
@@ -299,6 +299,16 @@ pub struct ParquetSource {
     /// so we still need to sort them after reading, so the reverse scan is inexact.
     /// Used to optimize ORDER BY ... DESC on sorted data.
     reverse_row_groups: bool,
+    /// The file metadata cache, if caching is enabled. Used to compute per-scan
+    /// hit/miss deltas for EXPLAIN ANALYZE output.
+    file_metadata_cache: Option<Arc<dyn FileMetadataCache>>,
+    /// Cache hit/miss counter values captured when this source was constructed.
+    /// The EXPLAIN ANALYZE delta is `current - baseline`.
+    hits_at_construction: usize,
+    misses_at_construction: usize,
+    /// Gauge metrics registered in `self.metrics`; `None` when no cache is configured.
+    metadata_cache_hits_gauge: Option<Gauge>,
+    metadata_cache_misses_gauge: Option<Gauge>,
 }
 
 impl ParquetSource {
@@ -326,6 +336,11 @@ impl ParquetSource {
             reverse_row_groups: false,
             data_cache_opt: None,
             config_options_opt: None,
+            file_metadata_cache: None,
+            hits_at_construction: 0,
+            misses_at_construction: 0,
+            metadata_cache_hits_gauge: None,
+            metadata_cache_misses_gauge: None,
         }
     }
 
@@ -391,6 +406,28 @@ impl ParquetSource {
         parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
     ) -> Self {
         self.parquet_file_reader_factory = Some(parquet_file_reader_factory);
+        self
+    }
+
+    /// Set the file metadata cache so that cache hits/misses for this scan are
+    /// reported in EXPLAIN ANALYZE output.
+    ///
+    /// The current hit/miss counts are snapshotted at call time; the delta shown
+    /// in EXPLAIN ANALYZE reflects cache activity that occurred after this call.
+    pub fn with_file_metadata_cache(mut self, cache: Arc<dyn FileMetadataCache>) -> Self {
+        self.hits_at_construction = cache.hit_count();
+        self.misses_at_construction = cache.miss_count();
+        self.metadata_cache_hits_gauge = Some(
+            MetricBuilder::new(&self.metrics)
+                .with_type(MetricType::SUMMARY)
+                .gauge("metadata_cache_hits", 0),
+        );
+        self.metadata_cache_misses_gauge = Some(
+            MetricBuilder::new(&self.metrics)
+                .with_type(MetricType::SUMMARY)
+                .gauge("metadata_cache_misses", 0),
+        );
+        self.file_metadata_cache = Some(cache);
         self
     }
 
@@ -614,6 +651,14 @@ impl FileSource for ParquetSource {
     }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
+        if let (Some(cache), Some(hits_gauge), Some(misses_gauge)) = (
+            &self.file_metadata_cache,
+            &self.metadata_cache_hits_gauge,
+            &self.metadata_cache_misses_gauge,
+        ) {
+            hits_gauge.set(cache.hit_count().saturating_sub(self.hits_at_construction));
+            misses_gauge.set(cache.miss_count().saturating_sub(self.misses_at_construction));
+        }
         &self.metrics
     }
 

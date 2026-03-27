@@ -473,9 +473,13 @@ impl FileFormat for ParquetFormat {
         let store = state
             .runtime_env()
             .object_store(conf.object_store_url.clone())?;
-        let cached_parquet_read_factory =
-            Arc::new(CachedParquetFileReaderFactory::new(store, metadata_cache));
-        source = source.with_parquet_file_reader_factory(cached_parquet_read_factory);
+        let cached_parquet_read_factory = Arc::new(CachedParquetFileReaderFactory::new(
+            store,
+            Arc::clone(&metadata_cache),
+        ));
+        source = source
+            .with_parquet_file_reader_factory(cached_parquet_read_factory)
+            .with_file_metadata_cache(metadata_cache);
 
         if let Some(metadata_size_hint) = metadata_size_hint {
             source = source.with_metadata_size_hint(metadata_size_hint)
