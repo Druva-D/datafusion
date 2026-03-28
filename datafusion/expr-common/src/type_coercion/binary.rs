@@ -1911,10 +1911,10 @@ fn temporal_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataTyp
             Some(Timestamp(Nanosecond, None))
         }
         (Timestamp(_, None), Date32) | (Date32, Timestamp(_, None)) => {
-            Some(Timestamp(Nanosecond, None))
+            Some(Timestamp(Microsecond, None))
         }
         (Timestamp(_, _tz), Date32) | (Date32, Timestamp(_, _tz)) => {
-            Some(Timestamp(Nanosecond, None))
+            Some(Timestamp(Microsecond, None))
         }
         _ => None,
     }
