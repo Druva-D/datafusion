@@ -38,6 +38,7 @@ use datafusion_common::config::TableParquetOptions;
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::{EquivalenceProperties, conjunction};
 use datafusion_physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
@@ -49,8 +50,9 @@ use datafusion_physical_plan::filter_pushdown::PushedDown;
 use datafusion_physical_plan::filter_pushdown::{
     FilterPushdownPropagation, PushedDownPredicate,
 };
-use datafusion_execution::cache::cache_manager::FileMetadataCache;
-use datafusion_physical_plan::metrics::{Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricType};
+use datafusion_physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricType,
+};
 
 #[cfg(feature = "parquet_encryption")]
 use datafusion_execution::parquet_encryption::EncryptionFactory;
@@ -657,7 +659,11 @@ impl FileSource for ParquetSource {
             &self.metadata_cache_misses_gauge,
         ) {
             hits_gauge.set(cache.hit_count().saturating_sub(self.hits_at_construction));
-            misses_gauge.set(cache.miss_count().saturating_sub(self.misses_at_construction));
+            misses_gauge.set(
+                cache
+                    .miss_count()
+                    .saturating_sub(self.misses_at_construction),
+            );
         }
         &self.metrics
     }
