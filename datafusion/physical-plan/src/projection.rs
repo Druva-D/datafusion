@@ -29,7 +29,7 @@ use super::{
 use crate::execution_plan::CardinalityEffect;
 use crate::filter_pushdown::{
     ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
-    FilterPushdownPropagation, FilterRemapper, PushedDownPredicate,
+    FilterPushdownPropagation, PushedDownPredicate,
 };
 use crate::joins::utils::{ColumnIndex, JoinFilter, JoinOn, JoinOnRef};
 use crate::util::PhysicalColumnRewriter;
@@ -46,19 +46,19 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
-use datafusion_common::{DataFusionError, JoinSide, Result, internal_err};
+use datafusion_common::{JoinSide, Result, internal_err};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::projection::Projector;
-use datafusion_physical_expr::utils::collect_columns;
-use datafusion_physical_expr_common::physical_expr::{PhysicalExprRef, fmt_sql};
-use datafusion_physical_expr_common::sort_expr::{
-    LexOrdering, LexRequirement, PhysicalSortExpr,
-};
 // Re-exported from datafusion-physical-expr for backwards compatibility
 // We recommend updating your imports to use datafusion-physical-expr directly
 pub use datafusion_physical_expr::projection::{
     ProjectionExpr, ProjectionExprs, update_expr,
+};
+use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr_common::physical_expr::{PhysicalExprRef, fmt_sql};
+use datafusion_physical_expr_common::sort_expr::{
+    LexOrdering, LexRequirement, PhysicalSortExpr,
 };
 
 use futures::stream::{Stream, StreamExt};
@@ -200,18 +200,14 @@ impl ProjectionExec {
         &self,
     ) -> Result<datafusion_common::HashMap<Column, Arc<dyn PhysicalExpr>>> {
         let mut alias_map = datafusion_common::HashMap::new();
-        for projection in self.projection_expr().iter() {
-            let (aliased_index, _output_field) = self
-                .projector
-                .output_schema()
-                .column_with_name(&projection.alias)
-                .ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "Expr {} with alias {} not found in output schema",
-                        projection.expr, projection.alias
-                    ))
-                })?;
-            let aliased_col = Column::new(&projection.alias, aliased_index);
+        // Use the enumerate index directly rather than `column_with_name`,
+        // because the output schema columns are ordered identically to the
+        // projection expressions.  `column_with_name` returns the *first*
+        // column with a given name, which silently produces duplicate HashMap
+        // keys (and overwrites earlier entries) when the projection contains
+        // same-named columns from different join sides.
+        for (idx, projection) in self.projection_expr().iter().enumerate() {
+            let aliased_col = Column::new(&projection.alias, idx);
             alias_map.insert(aliased_col, Arc::clone(&projection.expr));
         }
         Ok(alias_map)
@@ -373,16 +369,22 @@ impl ExecutionPlan for ProjectionExec {
     ) -> Result<FilterDescription> {
         // expand alias column to original expr in parent filters
         let invert_alias_map = self.collect_reverse_alias()?;
-        let output_schema = self.schema();
-        let remapper = FilterRemapper::new(output_schema);
         let mut child_parent_filters = Vec::with_capacity(parent_filters.len());
 
         for filter in parent_filters {
-            // Check that column exists in child, then reassign column indices to match child schema
-            if let Some(reassigned) = remapper.try_remap(&filter)? {
-                // rewrite filter expression using invert alias map
+            // Validate that every column referenced by the filter exists in
+            // the reverse-alias map (keyed by exact (name, index) pair).
+            // We must NOT use FilterRemapper::try_remap here because its
+            // index_of lookup returns the *first* column with a given name,
+            // which silently re-targets the filter to the wrong column when
+            // the projection output contains duplicate column names (e.g.
+            // after a join where both sides have an `id` column).
+            let columns = collect_columns(&filter);
+            let all_in_alias_map =
+                columns.iter().all(|col| invert_alias_map.contains_key(col));
+            if all_in_alias_map {
                 let mut rewriter = PhysicalColumnRewriter::new(&invert_alias_map);
-                let rewritten = reassigned.rewrite(&mut rewriter)?.data;
+                let rewritten = filter.rewrite(&mut rewriter)?.data;
                 child_parent_filters.push(PushedDownPredicate::supported(rewritten));
             } else {
                 child_parent_filters.push(PushedDownPredicate::unsupported(filter));
@@ -1737,6 +1739,174 @@ mod tests {
         assert_eq!(
             format!("{}", pushed_filters.predicate),
             "DynamicFilter [ b@0 - 1 > 5 ]"
+        );
+
+        Ok(())
+    }
+
+    /// Helper: builds a ProjectionExec with duplicate "id" column names,
+    /// simulating the plan structure above a LEFT JOIN where both sides
+    /// have an `id` column.
+    ///
+    ///   input (join output): [left_id, left_val, right_id]
+    ///   projection output:   [right_id@2 as id, left_val@1 as val, left_id@0 as id]
+    ///
+    /// Output column 0 ("id") comes from right_id@2.
+    /// Output column 2 ("id") comes from left_id@0.
+    fn make_duplicate_name_projection() -> Result<ProjectionExec> {
+        let input_schema = Schema::new(vec![
+            Field::new("left_id", DataType::Int32, true),
+            Field::new("left_val", DataType::Utf8, true),
+            Field::new("right_id", DataType::Int32, true),
+        ]);
+        let input = Arc::new(StatisticsExec::new(
+            Statistics {
+                column_statistics: vec![Default::default(); input_schema.fields().len()],
+                ..Default::default()
+            },
+            input_schema,
+        ));
+
+        ProjectionExec::try_new(
+            vec![
+                ProjectionExpr {
+                    expr: Arc::new(Column::new("right_id", 2)),
+                    alias: "id".to_string(),
+                },
+                ProjectionExpr {
+                    expr: Arc::new(Column::new("left_val", 1)),
+                    alias: "val".to_string(),
+                },
+                ProjectionExpr {
+                    expr: Arc::new(Column::new("left_id", 0)),
+                    alias: "id".to_string(),
+                },
+            ],
+            input,
+        )
+    }
+
+    /// Regression test for Fix 1 (collect_reverse_alias).
+    ///
+    /// Filter references the FIRST occurrence of a duplicate name: `id@0`.
+    /// Without Fix 1, collect_reverse_alias uses column_with_name() which
+    /// always returns index 0 for "id". The second projection entry
+    /// (left_id@0 as id) overwrites the first (right_id@2 as id) in the
+    /// HashMap, so id@0 incorrectly maps to left_id@0 instead of right_id@2.
+    ///
+    /// This is the exact scenario from the production anti-join query where
+    /// `txn.order_id IS NULL` was pushed into ec_sessions scan.
+    #[test]
+    fn test_filter_pushdown_duplicate_names_first_occurrence() -> Result<()> {
+        let projection = make_duplicate_name_projection()?;
+
+        // id@0 IS NULL — checks output column 0, sourced from right_id@2
+        let filter = Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
+            Arc::new(Column::new("id", 0)),
+        )) as Arc<dyn PhysicalExpr>;
+
+        let description = projection.gather_filters_for_pushdown(
+            FilterPushdownPhase::Pre,
+            vec![filter],
+            &ConfigOptions::default(),
+        )?;
+
+        let pushed = &description.parent_filters()[0];
+        assert_eq!(pushed.len(), 1);
+        assert!(
+            matches!(pushed[0].discriminant, PushedDown::Yes),
+            "filter on first 'id' column should be pushable"
+        );
+        assert_eq!(
+            format!("{}", pushed[0].predicate),
+            "right_id@2 IS NULL",
+            "id@0 must remap to right_id@2, not left_id@0"
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for Fix 2 (remove FilterRemapper::try_remap).
+    ///
+    /// Filter references the SECOND occurrence of a duplicate name: `id@2`.
+    /// Even with Fix 1 (correct alias map), the old try_remap step uses
+    /// index_of("id") which returns 0 (first match), silently rewriting
+    /// id@2 to id@0 before the alias map lookup. The lookup then finds
+    /// the entry for output column 0 (right_id@2) instead of output
+    /// column 2 (left_id@0).
+    ///
+    /// Fix 2 removes try_remap and validates directly against the alias
+    /// map using exact (name, index) keys, so id@2 stays as id@2 and
+    /// correctly maps to left_id@0.
+    #[test]
+    fn test_filter_pushdown_duplicate_names_second_occurrence() -> Result<()> {
+        let projection = make_duplicate_name_projection()?;
+
+        // id@2 IS NULL — checks output column 2, sourced from left_id@0
+        let filter = Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
+            Arc::new(Column::new("id", 2)),
+        )) as Arc<dyn PhysicalExpr>;
+
+        let description = projection.gather_filters_for_pushdown(
+            FilterPushdownPhase::Pre,
+            vec![filter],
+            &ConfigOptions::default(),
+        )?;
+
+        let pushed = &description.parent_filters()[0];
+        assert_eq!(pushed.len(), 1);
+        assert!(
+            matches!(pushed[0].discriminant, PushedDown::Yes),
+            "filter on second 'id' column should be pushable"
+        );
+        assert_eq!(
+            format!("{}", pushed[0].predicate),
+            "left_id@0 IS NULL",
+            "id@2 must remap to left_id@0, not right_id@2"
+        );
+
+        Ok(())
+    }
+
+    /// Combined regression test: both filters pushed through simultaneously.
+    ///
+    /// Ensures Fix 1 and Fix 2 work together — each duplicate-named column
+    /// independently remaps to its correct source expression.
+    #[test]
+    fn test_filter_pushdown_duplicate_names_both_filters() -> Result<()> {
+        let projection = make_duplicate_name_projection()?;
+
+        // Push both filters at once
+        let filter_first =
+            Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
+                Arc::new(Column::new("id", 0)),
+            )) as Arc<dyn PhysicalExpr>;
+        let filter_second =
+            Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
+                Arc::new(Column::new("id", 2)),
+            )) as Arc<dyn PhysicalExpr>;
+
+        let description = projection.gather_filters_for_pushdown(
+            FilterPushdownPhase::Pre,
+            vec![filter_first, filter_second],
+            &ConfigOptions::default(),
+        )?;
+
+        let pushed = &description.parent_filters()[0];
+        assert_eq!(pushed.len(), 2);
+
+        assert!(matches!(pushed[0].discriminant, PushedDown::Yes));
+        assert!(matches!(pushed[1].discriminant, PushedDown::Yes));
+
+        assert_eq!(
+            format!("{}", pushed[0].predicate),
+            "right_id@2 IS NULL",
+            "id@0 → right_id@2"
+        );
+        assert_eq!(
+            format!("{}", pushed[1].predicate),
+            "left_id@0 IS NULL",
+            "id@2 → left_id@0"
         );
 
         Ok(())
