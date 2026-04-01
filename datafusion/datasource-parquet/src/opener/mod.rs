@@ -285,6 +285,11 @@ impl FileOpener for ParquetOpener {
             })?;
             predicate = predicate
                 .map(|p| replace_columns_with_literals(p, &literal_columns))
+                .transpose()?
+                .map(|predicate| {
+                    let simplifier = PhysicalExprSimplifier::new(&logical_file_schema);
+                    simplifier.simplify(predicate)
+                })
                 .transpose()?;
         }
 
