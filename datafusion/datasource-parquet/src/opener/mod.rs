@@ -812,10 +812,6 @@ impl FileOpener for ParquetOpener {
             let max_memory_used = file_metrics.max_memory_used.clone();
             let data_cache_bytes_hit = file_metrics.data_cache_bytes_hit.clone();
             let data_cache_bytes_missed = file_metrics.data_cache_bytes_missed.clone();
-            let data_cache_memory_bytes_hit =
-                file_metrics.data_cache_memory_bytes_hit.clone();
-            let data_cache_disk_bytes_hit =
-                file_metrics.data_cache_disk_bytes_hit.clone();
             let row_groups_fully_filtered =
                 file_metrics.row_groups_fully_filtered.clone();
 
@@ -840,8 +836,6 @@ impl FileOpener for ParquetOpener {
                         &max_memory_used,
                         &data_cache_bytes_hit,
                         &data_cache_bytes_missed,
-                        &data_cache_memory_bytes_hit,
-                        &data_cache_disk_bytes_hit,
                         &row_groups_fully_filtered,
                     );
                     b = projector.project_batch(&b)?;
@@ -892,8 +886,6 @@ fn copy_arrow_reader_metrics(
     max_memory_used: &Gauge,
     data_cache_bytes_hit: &Gauge,
     data_cache_bytes_missed: &Gauge,
-    data_cache_memory_bytes_hit: &Gauge,
-    data_cache_disk_bytes_hit: &Gauge,
     row_groups_fully_filtered: &Gauge,
 ) {
     if let Some(v) = arrow_reader_metrics.records_read_from_inner() {
@@ -914,14 +906,6 @@ fn copy_arrow_reader_metrics(
 
     if let Some(v) = arrow_reader_metrics.data_cache_bytes_missed() {
         data_cache_bytes_missed.set(v);
-    }
-
-    if let Some(v) = arrow_reader_metrics.data_cache_memory_bytes_hit() {
-        data_cache_memory_bytes_hit.set(v);
-    }
-
-    if let Some(v) = arrow_reader_metrics.data_cache_disk_bytes_hit() {
-        data_cache_disk_bytes_hit.set(v);
     }
 
     if let Some(v) = arrow_reader_metrics.row_groups_fully_filtered() {

@@ -82,10 +82,6 @@ pub struct ParquetFileMetrics {
     pub data_cache_bytes_hit: Gauge,
     /// Data Cache: total bytes fetched from storage (misses)
     pub data_cache_bytes_missed: Gauge,
-    /// Data Cache: bytes served from the in-memory tier
-    pub data_cache_memory_bytes_hit: Gauge,
-    /// Data Cache: bytes served from the disk tier
-    pub data_cache_disk_bytes_hit: Gauge,
     /// Number of row groups that were not pruned but produced zero rows
     /// after row-level filter evaluation
     pub row_groups_fully_filtered: Gauge,
@@ -188,14 +184,6 @@ impl ParquetFileMetrics {
             .with_new_label("filename", filename.to_string())
             .gauge("data_cache_bytes_missed", partition);
 
-        let data_cache_memory_bytes_hit = MetricBuilder::new(metrics)
-            .with_new_label("filename", filename.to_string())
-            .gauge("data_cache_memory_bytes_hit", partition);
-
-        let data_cache_disk_bytes_hit = MetricBuilder::new(metrics)
-            .with_new_label("filename", filename.to_string())
-            .gauge("data_cache_disk_bytes_hit", partition);
-
         let row_groups_fully_filtered = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
             .gauge("row_groups_fully_filtered", partition);
@@ -220,8 +208,6 @@ impl ParquetFileMetrics {
             predicate_cache_records,
             data_cache_bytes_hit,
             data_cache_bytes_missed,
-            data_cache_memory_bytes_hit,
-            data_cache_disk_bytes_hit,
             row_groups_fully_filtered,
         }
     }
