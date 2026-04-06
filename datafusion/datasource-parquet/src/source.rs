@@ -346,6 +346,12 @@ impl ParquetSource {
         }
     }
 
+    /// (e6data-added) Set the table schema for this ParquetSource.
+    pub fn with_table_schema(mut self, table_schema: impl Into<TableSchema>) -> Self {
+        self.table_schema = table_schema.into();
+        self
+    }
+
     /// Set the `TableParquetOptions` for this ParquetSource.
     pub fn with_table_parquet_options(
         mut self,
