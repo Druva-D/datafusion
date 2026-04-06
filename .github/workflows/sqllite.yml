@@ -46,10 +46,10 @@ jobs:
           path: e6-arrow-rs
           fetch-depth: 1
           token: ${{ secrets.E6_ARROW_RS_PAT }}
-      - name: Setup Rust toolchain
-        uses: ./e6-datafusion/.github/actions/setup-builder
-        with:
-          rust-version: stable
+      # Don't use setup-builder to avoid configuring RUST_BACKTRACE which is expensive
+      - name: Install protobuf compiler
+        run: |
+          apt-get update && apt-get install -y protobuf-compiler
       - name: Run sqllite tests
         run: |
           export RUST_MIN_STACK=30485760
