@@ -78,13 +78,13 @@ impl DeletionVectorFilter {
             .last()
             .expect("row_number column did not have last value");
 
-        // Binary search to find the slice of deleted rows in [batch_start, batch_end)
+        // Binary search to find the slice of deleted rows in [batch_start, batch_end]
         let lo = self
             .deleted_rows_sorted
             .partition_point(|&x| x < row_number_start);
         let hi = self
             .deleted_rows_sorted
-            .partition_point(|&x| x < row_number_end);
+            .partition_point(|&x| x <= row_number_end);
         let relevant = &self.deleted_rows_sorted[lo..hi];
 
         let batch_len = array.len();
@@ -200,6 +200,64 @@ impl PhysicalExpr for DeletionVectorFilter {
             write!(f, "{}", value)?;
         }
         write!(f, ")")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+
+    fn make_filter(offsets: Vec<u64>) -> DeletionVectorFilter {
+        let schema = Schema::new(vec![arrow::datatypes::Field::new(
+            "row_number",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]);
+        DeletionVectorFilter::try_new(offsets, &schema).unwrap()
+    }
+
+    fn kept_rows(filter: &DeletionVectorFilter, start: i64, len: usize) -> Vec<i64> {
+        let values: Vec<i64> = (start..start + len as i64).collect();
+        let array = Int64Array::from(values.clone());
+        let mask = filter.filter_contiguous_batch(&array);
+        values
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| mask.value(*i))
+            .map(|(_, v)| v)
+            .collect()
+    }
+
+    #[test]
+    fn test_no_deletions_in_range() {
+        let filter = make_filter(vec![0, 1, 2, 100, 200]);
+        // Batch rows 10..15, no deletions overlap
+        assert_eq!(kept_rows(&filter, 10, 5), vec![10, 11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn test_partial_deletions() {
+        let filter = make_filter(vec![5, 11, 13, 20]);
+        assert_eq!(kept_rows(&filter, 10, 5), vec![10, 12, 14]);
+    }
+
+    #[test]
+    fn test_all_rows_deleted() {
+        let filter = make_filter(vec![10, 11, 12, 13, 14]);
+        assert!(kept_rows(&filter, 10, 5).is_empty());
+    }
+
+    #[test]
+    fn test_last_row_deleted() {
+        let filter = make_filter(vec![14]);
+        assert_eq!(kept_rows(&filter, 10, 5), vec![10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn test_unsorted_offsets() {
+        let filter = make_filter(vec![14, 10, 12]);
+        assert_eq!(kept_rows(&filter, 10, 5), vec![11, 13]);
     }
 }
 
