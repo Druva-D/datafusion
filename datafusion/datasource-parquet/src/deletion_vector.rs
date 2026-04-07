@@ -1,11 +1,18 @@
-use arrow::array::{BooleanArray, RecordBatch};
-use arrow::compute::filter_record_batch;
-use arrow::datatypes::SchemaRef;
-use datafusion_common::{DataFusionError, Result, ScalarValue};
+use arrow::array::{Array, AsArray, BooleanArray, PrimitiveArray, RecordBatch};
+use arrow::buffer::BooleanBuffer;
+use arrow::compute::{filter_record_batch, take};
+use arrow::datatypes::{Int64Type, Schema, SchemaRef};
+use arrow::downcast_dictionary_array;
+use datafusion_common::{DataFusionError, HashSet, Result, exec_datafusion_err};
+use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_expr::expressions::{Column, Literal, in_list};
+use datafusion_physical_expr::expressions::Column;
 use futures::{Stream, StreamExt};
+use itertools::Itertools;
 
+use std::any::Any;
+use std::fmt::Display;
+use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, ready};
@@ -13,7 +20,7 @@ use std::task::{Context, Poll, ready};
 #[derive(Debug, Clone)]
 pub struct DeletionVectorHolder {
     pub offsets: Vec<u64>,
-    filter_expr: OnceLock<Arc<dyn PhysicalExpr>>,
+    filter_expr: OnceLock<Result<Arc<dyn PhysicalExpr>, Arc<DataFusionError>>>,
 }
 
 impl DeletionVectorHolder {
@@ -25,31 +32,177 @@ impl DeletionVectorHolder {
     }
 
     pub fn filter_expr(&self, schema: SchemaRef) -> Result<Arc<dyn PhysicalExpr>> {
-        match self.filter_expr.get() {
-            Some(filter_expr) => Ok(Arc::clone(&filter_expr)),
-            None => {
-                let expr: Arc<dyn PhysicalExpr> =
-                    Arc::new(Column::new_with_schema("row_number", &schema)?);
-                let dv_offsets: Vec<Arc<dyn PhysicalExpr>> = self
-                    .offsets
-                    .iter()
-                    .map(|offset| {
-                        Arc::new(Literal::new(ScalarValue::Int64(Some(*offset as i64))))
-                            as _
-                    })
-                    .collect();
+        self.filter_expr
+            .get_or_init(|| {
+                DeletionVectorFilter::try_new(self.offsets.clone(), &schema)
+                    .map(|f| Arc::new(f) as Arc<dyn PhysicalExpr>)
+                    .map_err(|e| Arc::new(e))
+            })
+            .clone()
+            .map_err(|e| DataFusionError::Shared(e))
+    }
+}
 
-                let filter_expr = in_list(expr, dv_offsets, &true, &schema)?;
-                self.filter_expr
-                    .set(Arc::clone(&filter_expr))
-                    .map_err(|_| {
-                        DataFusionError::Internal(
-                            "Unable to set DV filter expr".to_string(),
-                        )
-                    })?;
-                Ok(filter_expr)
+#[derive(Debug, Eq)]
+pub struct DeletionVectorFilter {
+    deleted_rows: HashSet<i64>,
+    deleted_rows_sorted: Vec<i64>,
+    column_expr: Arc<dyn PhysicalExpr>,
+}
+
+impl DeletionVectorFilter {
+    pub fn try_new(offsets: Vec<u64>, schema: &Schema) -> Result<Self> {
+        Ok(Self {
+            deleted_rows: offsets.clone().into_iter().map(|o| o as i64).collect(),
+            deleted_rows_sorted: offsets.into_iter().map(|o| o as i64).sorted().collect(),
+            column_expr: Arc::new(Column::new_with_schema("row_number", schema)?),
+        })
+    }
+
+    fn filter_contiguous_batch(
+        &self,
+        array: &PrimitiveArray<Int64Type>,
+    ) -> BooleanBuffer {
+        let array_values = array.values();
+
+        let row_number_start = *array_values
+            .first()
+            .expect("row_number column did not have first value");
+        let row_number_end = *array_values
+            .last()
+            .expect("row_number column did not have last value");
+
+        // Binary search to find the slice of deleted rows in [batch_start, batch_end)
+        let lo = self
+            .deleted_rows_sorted
+            .partition_point(|&x| x < row_number_start);
+        let hi = self
+            .deleted_rows_sorted
+            .partition_point(|&x| x < row_number_end);
+        let relevant = &self.deleted_rows_sorted[lo..hi];
+
+        let batch_len = array.len();
+
+        // Fast path: no rows in this batch deleted, so return all true.
+        if relevant.is_empty() {
+            return BooleanBuffer::new_set(batch_len);
+        }
+
+        BooleanBuffer::collect_bool(batch_len, |i| {
+            let row = &array_values[i];
+            relevant.binary_search(&row).is_err()
+        })
+    }
+
+    fn contains(&self, array: &dyn Array) -> Result<BooleanArray> {
+        let array = array.as_primitive_opt::<Int64Type>().ok_or_else(|| {
+            exec_datafusion_err!(
+                "Failed to downcast deletion vector array to a 'int64' array. Actual type is {}", array.data_type()
+            )
+        })?;
+
+        let contains_buffer = self.filter_contiguous_batch(array);
+
+        // Naive hashset approach for reference.
+        // let array_values = array.values();
+        //
+        // let contains_buffer = BooleanBuffer::collect_bool(array_values.len(), |i| {
+        //     !self.deleted_rows.contains(&array_values[i])
+        // });
+
+        Ok(BooleanArray::new(contains_buffer, None))
+    }
+}
+
+impl Hash for DeletionVectorFilter {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        for value in &self.deleted_rows {
+            value.hash(state);
+        }
+        self.column_expr.hash(state);
+    }
+}
+
+impl PartialEq for DeletionVectorFilter {
+    fn eq(&self, other: &Self) -> bool {
+        self.deleted_rows == other.deleted_rows && &self.column_expr == &other.column_expr
+    }
+}
+
+impl Display for DeletionVectorFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const VALUES_TO_SHOW: usize = 10;
+
+        let mut values = self
+            .deleted_rows
+            .iter()
+            .take(VALUES_TO_SHOW)
+            .map(|num| num.to_string())
+            .join(", ");
+
+        if values.len() > VALUES_TO_SHOW {
+            values.push_str(&format!("...+{}", values.len() - VALUES_TO_SHOW));
+        }
+
+        write!(f, "DeletionVector({}) IN ({values})", self.column_expr)
+    }
+}
+
+impl PhysicalExpr for DeletionVectorFilter {
+    fn as_any(&self) -> &dyn Any {
+        self as &dyn Any
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+        let value = self.column_expr.evaluate(batch)?;
+        match value {
+            ColumnarValue::Array(array) => {
+                let array = array.as_ref();
+                // Handle dictionary arrays by recursing on the values
+                downcast_dictionary_array! {
+                    array => {
+                        let values_contains = self.contains(array.values().as_ref())?;
+                        let result = take(&values_contains, array.keys(), None)?;
+                        return Ok(ColumnarValue::Array(result));
+                    }
+                    _ => {}
+                }
+
+                Ok(ColumnarValue::Array(Arc::new(self.contains(array)?)))
+            }
+            ColumnarValue::Scalar(scalar_value) => {
+                let array = scalar_value.to_array()?;
+                Ok(ColumnarValue::Array(Arc::new(self.contains(&array)?)))
             }
         }
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.column_expr]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        Ok(Arc::new(Self {
+            column_expr: Arc::clone(&children[0]),
+            deleted_rows_sorted: self.deleted_rows_sorted.clone(),
+            deleted_rows: self.deleted_rows.clone(),
+        }))
+    }
+
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.column_expr.fmt_sql(f)?;
+
+        write!(f, " IN (")?;
+        for (i, value) in self.deleted_rows_sorted.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{}", value)?;
+        }
+        write!(f, ")")
     }
 }
 
