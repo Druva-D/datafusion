@@ -73,11 +73,11 @@ pub struct ParquetFileMetrics {
     pub scan_efficiency_ratio: RatioMetrics,
     /// Predicate Cache: number of records read directly from the inner reader.
     /// This is the number of rows decoded while evaluating predicates
-    pub predicate_cache_inner_records: Count,
+    pub predicate_cache_inner_records: Gauge,
     /// Predicate Cache: number of records read from the cache. This is the
     /// number of rows that were stored in the cache after evaluating predicates
     /// reused for the output.
-    pub predicate_cache_records: Count,
+    pub predicate_cache_records: Gauge,
     /// Data Cache: total bytes retrieved from cache (hits)
     pub data_cache_bytes_hit: Gauge,
     /// Data Cache: total bytes fetched from storage (misses)
@@ -170,11 +170,11 @@ impl ParquetFileMetrics {
 
         let predicate_cache_inner_records = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
-            .counter("predicate_cache_inner_records", partition);
+            .gauge("predicate_cache_inner_records", partition);
 
         let predicate_cache_records = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
-            .counter("predicate_cache_records", partition);
+            .gauge("predicate_cache_records", partition);
 
         let data_cache_bytes_hit = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())

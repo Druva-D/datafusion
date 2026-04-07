@@ -806,14 +806,6 @@ impl FileOpener for ParquetOpener {
 
             let files_ranges_pruned_statistics =
                 file_metrics.files_ranges_pruned_statistics.clone();
-            let predicate_cache_inner_records =
-                file_metrics.predicate_cache_inner_records.clone();
-            let predicate_cache_records = file_metrics.predicate_cache_records.clone();
-            let max_memory_used = file_metrics.max_memory_used.clone();
-            let data_cache_bytes_hit = file_metrics.data_cache_bytes_hit.clone();
-            let data_cache_bytes_missed = file_metrics.data_cache_bytes_missed.clone();
-            let row_groups_fully_filtered =
-                file_metrics.row_groups_fully_filtered.clone();
 
             // Check if we need to replace the schema to handle things like differing nullability or metadata.
             // See note below about file vs. output schema.
@@ -829,15 +821,6 @@ impl FileOpener for ParquetOpener {
 
             let stream = stream.map(move |b| {
                 b.and_then(|mut b| {
-                    copy_arrow_reader_metrics(
-                        &arrow_reader_metrics,
-                        &predicate_cache_inner_records,
-                        &predicate_cache_records,
-                        &max_memory_used,
-                        &data_cache_bytes_hit,
-                        &data_cache_bytes_missed,
-                        &row_groups_fully_filtered,
-                    );
                     b = projector.project_batch(&b)?;
                     if replace_schema {
                         // Ensure the output batch has the expected schema.
@@ -863,16 +846,46 @@ impl FileOpener for ParquetOpener {
                 })
             });
 
-            if let Some(file_pruner) = file_pruner {
-                Ok(EarlyStoppingStream::new(
+            let stream = if let Some(file_pruner) = file_pruner {
+                EarlyStoppingStream::new(
                     stream,
                     file_pruner,
                     files_ranges_pruned_statistics,
                 )
-                .boxed())
+                .boxed()
             } else {
-                Ok(stream.boxed())
-            }
+                stream.boxed()
+            };
+
+            // We don't use `stream::map` anymore, cause if we don't receive any rows
+            // from a file, we do not increment these metrics at all, this is fine for
+            // upstream, we instead want data_cache_bytes_hit, data_cache_bytes_missed
+            // and row_grups_fully_filtered to be populated everytime. And that's why
+            // we shift to using `streams::poll_fn` and `stream::chain
+            let predicate_cache_inner_records =
+                file_metrics.predicate_cache_inner_records.clone();
+            let predicate_cache_records = file_metrics.predicate_cache_records.clone();
+            let max_memory_used = file_metrics.max_memory_used.clone();
+            let data_cache_bytes_hit = file_metrics.data_cache_bytes_hit.clone();
+            let data_cache_bytes_missed = file_metrics.data_cache_bytes_missed.clone();
+            let row_groups_fully_filtered =
+                file_metrics.row_groups_fully_filtered.clone();
+            let finalizer = futures::stream::poll_fn(
+                move |_cx| -> Poll<Option<Result<RecordBatch>>> {
+                    copy_arrow_reader_metrics(
+                        &arrow_reader_metrics,
+                        &predicate_cache_inner_records,
+                        &predicate_cache_records,
+                        &max_memory_used,
+                        &data_cache_bytes_hit,
+                        &data_cache_bytes_missed,
+                        &row_groups_fully_filtered,
+                    );
+                    Poll::Ready(None)
+                },
+            );
+
+            Ok(stream.chain(finalizer).boxed())
         }))
     }
 }
@@ -881,8 +894,8 @@ impl FileOpener for ParquetOpener {
 /// arrow-rs parquet reader) to the parquet file metrics for DataFusion
 fn copy_arrow_reader_metrics(
     arrow_reader_metrics: &ArrowReaderMetrics,
-    predicate_cache_inner_records: &Count,
-    predicate_cache_records: &Count,
+    predicate_cache_inner_records: &Gauge,
+    predicate_cache_records: &Gauge,
     max_memory_used: &Gauge,
     data_cache_bytes_hit: &Gauge,
     data_cache_bytes_missed: &Gauge,
