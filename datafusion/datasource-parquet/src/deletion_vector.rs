@@ -3,7 +3,7 @@ use arrow::buffer::BooleanBuffer;
 use arrow::compute::{filter_record_batch, take};
 use arrow::datatypes::{Int64Type, Schema, SchemaRef};
 use arrow::downcast_dictionary_array;
-use datafusion_common::{DataFusionError, HashSet, Result, exec_datafusion_err};
+use datafusion_common::{DataFusionError, Result, exec_datafusion_err};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::Column;
@@ -45,7 +45,6 @@ impl DeletionVectorHolder {
 
 #[derive(Debug, Eq)]
 pub struct DeletionVectorFilter {
-    deleted_rows: HashSet<i64>,
     deleted_rows_sorted: Vec<i64>,
     column_expr: Arc<dyn PhysicalExpr>,
 }
@@ -53,12 +52,19 @@ pub struct DeletionVectorFilter {
 impl DeletionVectorFilter {
     pub fn try_new(offsets: Vec<u64>, schema: &Schema) -> Result<Self> {
         Ok(Self {
-            deleted_rows: offsets.clone().into_iter().map(|o| o as i64).collect(),
             deleted_rows_sorted: offsets.into_iter().map(|o| o as i64).sorted().collect(),
             column_expr: Arc::new(Column::new_with_schema("row_number", schema)?),
         })
     }
 
+    /// Optimized search for deleted rows.
+    ///
+    /// Makes use of the fact that we have sorted `row_number`s in `deleted_rows_sorted` and that
+    /// `row_number` is contiguous and non-decreasing within a record batch.
+    ///
+    /// Uses binary search to first do a fast-path check if the array can even contain deleted rows.
+    /// This operator also gives a subset of the deleted rows in which the array can potentially
+    /// have matches. Then we do a binary search for each element of the array.
     fn filter_contiguous_batch(
         &self,
         array: &PrimitiveArray<Int64Type>,
@@ -103,29 +109,21 @@ impl DeletionVectorFilter {
 
         let contains_buffer = self.filter_contiguous_batch(array);
 
-        // Naive hashset approach for reference.
-        // let array_values = array.values();
-        //
-        // let contains_buffer = BooleanBuffer::collect_bool(array_values.len(), |i| {
-        //     !self.deleted_rows.contains(&array_values[i])
-        // });
-
         Ok(BooleanArray::new(contains_buffer, None))
     }
 }
 
 impl Hash for DeletionVectorFilter {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        for value in &self.deleted_rows {
-            value.hash(state);
-        }
+        self.deleted_rows_sorted.hash(state);
         self.column_expr.hash(state);
     }
 }
 
 impl PartialEq for DeletionVectorFilter {
     fn eq(&self, other: &Self) -> bool {
-        self.deleted_rows == other.deleted_rows && &self.column_expr == &other.column_expr
+        self.deleted_rows_sorted == other.deleted_rows_sorted
+            && &self.column_expr == &other.column_expr
     }
 }
 
@@ -134,7 +132,7 @@ impl Display for DeletionVectorFilter {
         const VALUES_TO_SHOW: usize = 10;
 
         let mut values = self
-            .deleted_rows
+            .deleted_rows_sorted
             .iter()
             .take(VALUES_TO_SHOW)
             .map(|num| num.to_string())
@@ -188,7 +186,6 @@ impl PhysicalExpr for DeletionVectorFilter {
         Ok(Arc::new(Self {
             column_expr: Arc::clone(&children[0]),
             deleted_rows_sorted: self.deleted_rows_sorted.clone(),
-            deleted_rows: self.deleted_rows.clone(),
         }))
     }
 
