@@ -94,9 +94,15 @@ impl DeletionVectorFilter {
             return BooleanBuffer::new_set(batch_len);
         }
 
+        // Linear cursor merge: both array_values and relevant are sorted,
+        // so we walk a single cursor forward through relevant. O(n + d).
+        let mut del_idx = 0;
         BooleanBuffer::collect_bool(batch_len, |i| {
-            let row = &array_values[i];
-            relevant.binary_search(&row).is_err()
+            let row = array_values[i];
+            while del_idx < relevant.len() && relevant[del_idx] < row {
+                del_idx += 1;
+            }
+            del_idx >= relevant.len() || relevant[del_idx] != row
         })
     }
 
