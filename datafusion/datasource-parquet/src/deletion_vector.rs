@@ -3,7 +3,7 @@ use arrow::buffer::BooleanBuffer;
 use arrow::compute::{filter_record_batch, take};
 use arrow::datatypes::{Int64Type, Schema, SchemaRef};
 use arrow::downcast_dictionary_array;
-use datafusion_common::{DataFusionError, Result, exec_datafusion_err};
+use datafusion_common::{DataFusionError, Result, ScalarValue, exec_datafusion_err};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::Column;
@@ -65,11 +65,15 @@ impl DeletionVectorFilter {
     /// Uses binary search to first do a fast-path check if the array can even contain deleted rows.
     /// This operator also gives a subset of the deleted rows in which the array can potentially
     /// have matches. Then we do a binary search for each element of the array.
+    ///
+    /// Returns `ColumnarValue::Scalar(true)` when no rows need filtering (zero allocation),
+    /// or `ColumnarValue::Array(BooleanArray)` with the filter mask.
     fn filter_contiguous_batch(
         &self,
         array: &PrimitiveArray<Int64Type>,
-    ) -> BooleanBuffer {
+    ) -> ColumnarValue {
         let array_values = array.values();
+        let batch_len = array.len();
 
         let row_number_start = *array_values
             .first()
@@ -77,6 +81,15 @@ impl DeletionVectorFilter {
         let row_number_end = *array_values
             .last()
             .expect("row_number column did not have last value");
+
+        // Fast path: batch range doesn't overlap deletion range at all
+        if self.deleted_rows_sorted.is_empty()
+            || row_number_end < self.deleted_rows_sorted[0]
+            || row_number_start
+                > self.deleted_rows_sorted[self.deleted_rows_sorted.len() - 1]
+        {
+            return ColumnarValue::Scalar(ScalarValue::Boolean(Some(true)));
+        }
 
         // Binary search to find the slice of deleted rows in [batch_start, batch_end]
         let lo = self
@@ -87,35 +100,32 @@ impl DeletionVectorFilter {
             .partition_point(|&x| x <= row_number_end);
         let relevant = &self.deleted_rows_sorted[lo..hi];
 
-        let batch_len = array.len();
-
         // Fast path: no rows in this batch deleted, so return all true.
         if relevant.is_empty() {
-            return BooleanBuffer::new_set(batch_len);
+            return ColumnarValue::Scalar(ScalarValue::Boolean(Some(true)));
         }
 
         // Linear cursor merge: both array_values and relevant are sorted,
         // so we walk a single cursor forward through relevant. O(n + d).
         let mut del_idx = 0;
-        BooleanBuffer::collect_bool(batch_len, |i| {
+        let buffer = BooleanBuffer::collect_bool(batch_len, |i| {
             let row = array_values[i];
             while del_idx < relevant.len() && relevant[del_idx] < row {
                 del_idx += 1;
             }
             del_idx >= relevant.len() || relevant[del_idx] != row
-        })
+        });
+        ColumnarValue::Array(Arc::new(BooleanArray::new(buffer, None)))
     }
 
-    fn contains(&self, array: &dyn Array) -> Result<BooleanArray> {
+    fn contains(&self, array: &dyn Array) -> Result<ColumnarValue> {
         let array = array.as_primitive_opt::<Int64Type>().ok_or_else(|| {
             exec_datafusion_err!(
                 "Failed to downcast deletion vector array to a 'int64' array. Actual type is {}", array.data_type()
             )
         })?;
 
-        let contains_buffer = self.filter_contiguous_batch(array);
-
-        Ok(BooleanArray::new(contains_buffer, None))
+        Ok(self.filter_contiguous_batch(array))
     }
 }
 
@@ -165,18 +175,23 @@ impl PhysicalExpr for DeletionVectorFilter {
                 // Handle dictionary arrays by recursing on the values
                 downcast_dictionary_array! {
                     array => {
-                        let values_contains = self.contains(array.values().as_ref())?;
-                        let result = take(&values_contains, array.keys(), None)?;
-                        return Ok(ColumnarValue::Array(result));
+                        let result = self.contains(array.values().as_ref())?;
+                        match result {
+                            ColumnarValue::Scalar(_) => return Ok(result),
+                            ColumnarValue::Array(mask) => {
+                                let taken = take(&mask, array.keys(), None)?;
+                                return Ok(ColumnarValue::Array(taken));
+                            }
+                        }
                     }
                     _ => {}
                 }
 
-                Ok(ColumnarValue::Array(Arc::new(self.contains(array)?)))
+                self.contains(array)
             }
             ColumnarValue::Scalar(scalar_value) => {
                 let array = scalar_value.to_array()?;
-                Ok(ColumnarValue::Array(Arc::new(self.contains(&array)?)))
+                self.contains(&array)
             }
         }
     }
@@ -226,13 +241,18 @@ mod tests {
     fn kept_rows(filter: &DeletionVectorFilter, start: i64, len: usize) -> Vec<i64> {
         let values: Vec<i64> = (start..start + len as i64).collect();
         let array = Int64Array::from(values.clone());
-        let mask = filter.filter_contiguous_batch(&array);
-        values
-            .into_iter()
-            .enumerate()
-            .filter(|(i, _)| mask.value(*i))
-            .map(|(_, v)| v)
-            .collect()
+        match filter.filter_contiguous_batch(&array) {
+            ColumnarValue::Scalar(_) => values, // scalar true = all rows kept
+            ColumnarValue::Array(arr) => {
+                let mask = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+                values
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask.value(*i))
+                    .map(|(_, v)| v)
+                    .collect()
+            }
+        }
     }
 
     #[test]
@@ -296,18 +316,19 @@ where
             .deletion_vector_holder
             .filter_expr(schema)?
             .evaluate(&batch)?;
-        let boolean_array = predicate_result.into_array(batch.num_rows())?;
 
-        let mask = boolean_array
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap();
-
-        Some(
-            filter_record_batch(&batch, mask)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None)),
-        )
-        .transpose()
+        match predicate_result {
+            // Scalar true = no deletions in this batch, return as-is (zero allocation)
+            ColumnarValue::Scalar(_) => Ok(Some(batch)),
+            ColumnarValue::Array(array) => {
+                let mask = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                Some(
+                    filter_record_batch(&batch, mask)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None)),
+                )
+                .transpose()
+            }
+        }
     }
 
     pub fn schema(&self) -> &SchemaRef {
