@@ -306,7 +306,7 @@ impl AggregateUDFImpl for Sum {
                 Ok(Box::new(PrimitiveGroupsAccumulator::<$t, _>::new(
                     &$dt,
                     |x, y| *x = x.add_wrapping(y),
-                )))
+                ).with_starting_value_as_identity()))
             };
         }
         downcast_sum!(args, helper)
