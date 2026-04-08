@@ -78,10 +78,14 @@ pub struct ParquetFileMetrics {
     /// number of rows that were stored in the cache after evaluating predicates
     /// reused for the output.
     pub predicate_cache_records: Gauge,
-    /// Data Cache: total bytes retrieved from cache (hits)
-    pub data_cache_bytes_hit: Gauge,
-    /// Data Cache: total bytes fetched from storage (misses)
-    pub data_cache_bytes_missed: Gauge,
+    /// Total bytes served from cache (memory + disk)
+    pub data_cache_bytes_read: Gauge,
+    /// Bytes served from in-memory cache tier
+    pub data_cache_mem_bytes_read: Gauge,
+    /// Bytes served from disk cache tier
+    pub data_cache_disk_bytes_read: Gauge,
+    /// Total bytes read across all sources (cache + object store)
+    pub total_bytes_read: Gauge,
     /// Number of row groups that were not pruned but produced zero rows
     /// after row-level filter evaluation
     pub row_groups_fully_filtered: Gauge,
@@ -176,13 +180,21 @@ impl ParquetFileMetrics {
             .with_new_label("filename", filename.to_string())
             .gauge("predicate_cache_records", partition);
 
-        let data_cache_bytes_hit = MetricBuilder::new(metrics)
+        let data_cache_bytes_read = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
-            .gauge("data_cache_bytes_hit", partition);
+            .gauge("data_cache_bytes_read", partition);
 
-        let data_cache_bytes_missed = MetricBuilder::new(metrics)
+        let data_cache_mem_bytes_read = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
-            .gauge("data_cache_bytes_missed", partition);
+            .gauge("data_cache_mem_bytes_read", partition);
+
+        let data_cache_disk_bytes_read = MetricBuilder::new(metrics)
+            .with_new_label("filename", filename.to_string())
+            .gauge("data_cache_disk_bytes_read", partition);
+
+        let total_bytes_read = MetricBuilder::new(metrics)
+            .with_new_label("filename", filename.to_string())
+            .gauge("total_bytes_read", partition);
 
         let row_groups_fully_filtered = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
@@ -206,8 +218,10 @@ impl ParquetFileMetrics {
             scan_efficiency_ratio,
             predicate_cache_inner_records,
             predicate_cache_records,
-            data_cache_bytes_hit,
-            data_cache_bytes_missed,
+            data_cache_bytes_read,
+            data_cache_mem_bytes_read,
+            data_cache_disk_bytes_read,
+            total_bytes_read,
             row_groups_fully_filtered,
         }
     }

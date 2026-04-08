@@ -866,8 +866,12 @@ impl FileOpener for ParquetOpener {
                 file_metrics.predicate_cache_inner_records.clone();
             let predicate_cache_records = file_metrics.predicate_cache_records.clone();
             let max_memory_used = file_metrics.max_memory_used.clone();
-            let data_cache_bytes_hit = file_metrics.data_cache_bytes_hit.clone();
-            let data_cache_bytes_missed = file_metrics.data_cache_bytes_missed.clone();
+            let data_cache_bytes_read = file_metrics.data_cache_bytes_read.clone();
+            let data_cache_mem_bytes_read =
+                file_metrics.data_cache_mem_bytes_read.clone();
+            let data_cache_disk_bytes_read =
+                file_metrics.data_cache_disk_bytes_read.clone();
+            let total_bytes_read = file_metrics.total_bytes_read.clone();
             let row_groups_fully_filtered =
                 file_metrics.row_groups_fully_filtered.clone();
             let finalizer = futures::stream::poll_fn(
@@ -877,8 +881,10 @@ impl FileOpener for ParquetOpener {
                         &predicate_cache_inner_records,
                         &predicate_cache_records,
                         &max_memory_used,
-                        &data_cache_bytes_hit,
-                        &data_cache_bytes_missed,
+                        &data_cache_bytes_read,
+                        &data_cache_mem_bytes_read,
+                        &data_cache_disk_bytes_read,
+                        &total_bytes_read,
                         &row_groups_fully_filtered,
                     );
                     Poll::Ready(None)
@@ -897,8 +903,10 @@ fn copy_arrow_reader_metrics(
     predicate_cache_inner_records: &Gauge,
     predicate_cache_records: &Gauge,
     max_memory_used: &Gauge,
-    data_cache_bytes_hit: &Gauge,
-    data_cache_bytes_missed: &Gauge,
+    data_cache_bytes_read: &Gauge,
+    data_cache_mem_bytes_read: &Gauge,
+    data_cache_disk_bytes_read: &Gauge,
+    total_bytes_read: &Gauge,
     row_groups_fully_filtered: &Gauge,
 ) {
     if let Some(v) = arrow_reader_metrics.records_read_from_inner() {
@@ -913,12 +921,17 @@ fn copy_arrow_reader_metrics(
         max_memory_used.set_max(v);
     }
 
-    if let Some(v) = arrow_reader_metrics.data_cache_bytes_hit() {
-        data_cache_bytes_hit.set(v);
+    let cache_hit = arrow_reader_metrics.data_cache_bytes_hit().unwrap_or(0);
+    let cache_miss = arrow_reader_metrics.data_cache_bytes_missed().unwrap_or(0);
+    data_cache_bytes_read.set(cache_hit);
+    total_bytes_read.set(cache_hit + cache_miss);
+
+    if let Some(v) = arrow_reader_metrics.data_cache_mem_bytes_read() {
+        data_cache_mem_bytes_read.set(v);
     }
 
-    if let Some(v) = arrow_reader_metrics.data_cache_bytes_missed() {
-        data_cache_bytes_missed.set(v);
+    if let Some(v) = arrow_reader_metrics.data_cache_disk_bytes_read() {
+        data_cache_disk_bytes_read.set(v);
     }
 
     if let Some(v) = arrow_reader_metrics.row_groups_fully_filtered() {
