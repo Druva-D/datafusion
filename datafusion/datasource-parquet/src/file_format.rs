@@ -575,6 +575,8 @@ pub fn apply_file_schema_type_coercions(
 ) -> Option<Schema> {
     let mut needs_view_transform = false;
     let mut needs_string_transform = false;
+    // e6data-added
+    let mut needs_dictionary_transform = false;
 
     // Create a mapping of table field names to their data types for fast lookup
     // and simultaneously check if we need any transformations
@@ -594,13 +596,17 @@ pub fn apply_file_schema_type_coercions(
             ) {
                 needs_string_transform = true;
             }
+            // (e6data-added) check if we need dictionary type transformation
+            if matches!(dt, DataType::Dictionary(_, _)) {
+                needs_dictionary_transform = true;
+            }
 
             (f.name(), dt)
         })
         .collect();
 
     // Early return if no transformation needed
-    if !needs_view_transform && !needs_string_transform {
+    if !needs_view_transform && !needs_string_transform && !needs_dictionary_transform {
         return None;
     }
 
@@ -641,6 +647,19 @@ pub fn apply_file_schema_type_coercions(
                     }
                     (&DataType::BinaryView, DataType::Binary | DataType::LargeBinary) => {
                         return field_with_new_type(field, DataType::BinaryView);
+                    }
+                    // (e6data-added) Table schema uses dictionary type. Tell parquet to read as
+                    // dictionary.
+                    (
+                        DataType::Dictionary(_, _),
+                        DataType::Utf8
+                        | DataType::LargeUtf8
+                        | DataType::Utf8View
+                        | DataType::Binary
+                        | DataType::LargeBinary
+                        | DataType::BinaryView,
+                    ) => {
+                        return field_with_new_type(field, (*table_type).clone());
                     }
                     _ => {}
                 }
