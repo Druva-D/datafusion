@@ -165,6 +165,28 @@ mod tests {
     }
 
     #[test]
+    fn upper_dictionary() -> Result<()> {
+        use arrow::array::StringDictionaryBuilder;
+        use arrow::datatypes::Int32Type;
+
+        let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+        builder.append_value("hello");
+        builder.append_null();
+        builder.append_value("world");
+        builder.append_value("hello");
+        let input = Arc::new(builder.finish()) as ArrayRef;
+
+        let mut expected_builder = StringDictionaryBuilder::<Int32Type>::new();
+        expected_builder.append_value("HELLO");
+        expected_builder.append_null();
+        expected_builder.append_value("WORLD");
+        expected_builder.append_value("HELLO");
+        let expected = Arc::new(expected_builder.finish()) as ArrayRef;
+
+        to_upper(input, expected)
+    }
+
+    #[test]
     fn upper_partial_optimization() -> Result<()> {
         let input = Arc::new(StringArray::from(vec![
             Some("arrow"),

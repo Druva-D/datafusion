@@ -166,6 +166,28 @@ mod tests {
     }
 
     #[test]
+    fn lower_dictionary() -> Result<()> {
+        use arrow::array::StringDictionaryBuilder;
+        use arrow::datatypes::Int32Type;
+
+        let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+        builder.append_value("HELLO");
+        builder.append_null();
+        builder.append_value("WORLD");
+        builder.append_value("HELLO"); // repeated value tests dictionary sharing
+        let input = Arc::new(builder.finish()) as ArrayRef;
+
+        let mut expected_builder = StringDictionaryBuilder::<Int32Type>::new();
+        expected_builder.append_value("hello");
+        expected_builder.append_null();
+        expected_builder.append_value("world");
+        expected_builder.append_value("hello");
+        let expected = Arc::new(expected_builder.finish()) as ArrayRef;
+
+        to_lower(input, expected)
+    }
+
+    #[test]
     fn lower_partial_optimization() -> Result<()> {
         let input = Arc::new(StringArray::from(vec![
             Some("ARROW"),
