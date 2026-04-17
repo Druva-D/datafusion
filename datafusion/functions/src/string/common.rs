@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use crate::strings::make_and_append_view;
 use arrow::array::{
-    Array, ArrayRef, GenericStringArray, GenericStringBuilder, NullBufferBuilder,
-    OffsetSizeTrait, StringBuilder, StringViewArray, new_null_array,
+    Array, ArrayRef, AsArray, GenericStringArray, GenericStringBuilder,
+    NullBufferBuilder, OffsetSizeTrait, StringBuilder, StringViewArray, new_null_array,
 };
 use arrow::buffer::{Buffer, ScalarBuffer};
 use arrow::datatypes::DataType;
@@ -318,6 +318,35 @@ where
                 }
 
                 Ok(ColumnarValue::Array(Arc::new(string_builder.finish())))
+            }
+            DataType::Dictionary(_, value_type) => {
+                let dict_array = array.as_any_dictionary();
+                let values = dict_array.values();
+                let new_values = match value_type.as_ref() {
+                    DataType::Utf8 => case_conversion_array::<i32, _>(values, op)?,
+                    DataType::LargeUtf8 => case_conversion_array::<i64, _>(values, op)?,
+                    DataType::Utf8View => {
+                        let string_array = as_string_view_array(values)?;
+                        let mut string_builder = StringBuilder::with_capacity(
+                            string_array.len(),
+                            string_array.get_array_memory_size(),
+                        );
+                        for s in string_array.iter() {
+                            if let Some(s) = s {
+                                string_builder.append_value(op(s));
+                            } else {
+                                string_builder.append_null();
+                            }
+                        }
+                        Arc::new(string_builder.finish())
+                    }
+                    other => {
+                        return exec_err!(
+                            "Unsupported dictionary value type {other:?} for function {name}"
+                        );
+                    }
+                };
+                Ok(ColumnarValue::Array(dict_array.with_values(new_values)))
             }
             other => exec_err!("Unsupported data type {other:?} for function {name}"),
         },
