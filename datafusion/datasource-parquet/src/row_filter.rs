@@ -74,7 +74,7 @@ use parquet::file::metadata::ParquetMetaData;
 use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
-use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::expressions::{Column, IsNotNullExpr, IsNullExpr};
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 
@@ -119,12 +119,63 @@ impl DatafusionArrowPredicate {
         let physical_expr =
             reassign_expr_columns(candidate.expr, &candidate.filter_schema)?;
 
+        let schema_descr = metadata.file_metadata().schema_descr();
+
+        // For struct null checks, use leaf-level projection to read only
+        // the first leaf of each struct (definition levels encode struct nullability).
+        // For regular columns, use root-level projection as before.
+        let projection_mask = if candidate.struct_null_check_names.is_empty() {
+            ProjectionMask::roots(schema_descr, candidate.projection)
+        } else {
+            // For struct null checks, use leaf-level projection to read only
+            // the first leaf of each struct. For regular columns, include all
+            // their leaves via root-level expansion.
+            let struct_null_set: std::collections::HashSet<&str> = candidate
+                .struct_null_check_names
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+
+            let mut leaf_indices: Vec<usize> = Vec::new();
+            for &root_idx in &candidate.projection {
+                let root_mask = ProjectionMask::roots(schema_descr, [root_idx]);
+
+                // Check if this root is a struct null check by matching the
+                // first leaf's parquet path root against the struct names
+                let first_leaf =
+                    (0..schema_descr.num_columns()).find(|&i| root_mask.leaf_included(i));
+                let is_struct_null = first_leaf.is_some_and(|i| {
+                    schema_descr
+                        .column(i)
+                        .path()
+                        .parts()
+                        .first()
+                        .is_some_and(|p| struct_null_set.contains(p.as_str()))
+                });
+
+                if is_struct_null {
+                    // Only the first leaf — its definition levels encode the
+                    // struct's null bitmap
+                    if let Some(leaf) = first_leaf {
+                        leaf_indices.push(leaf);
+                    }
+                } else {
+                    for i in 0..schema_descr.num_columns() {
+                        if root_mask.leaf_included(i) {
+                            leaf_indices.push(i);
+                        }
+                    }
+                }
+            }
+
+            leaf_indices.sort_unstable();
+            leaf_indices.dedup();
+            ProjectionMask::leaves(schema_descr, leaf_indices)
+        };
+
         Ok(Self {
             physical_expr,
-            projection_mask: ProjectionMask::roots(
-                metadata.file_metadata().schema_descr(),
-                candidate.projection,
-            ),
+            projection_mask,
             rows_pruned,
             rows_matched,
             time,
@@ -181,6 +232,10 @@ pub(crate) struct FilterCandidate {
     /// The Arrow schema containing only the columns required by this filter,
     /// projected from the file's Arrow schema.
     pub filter_schema: SchemaRef,
+    /// Names of struct columns that need only a null check. When non-empty,
+    /// the projection mask uses leaf-level projection for these structs
+    /// (reading only 1 leaf per struct instead of all leaves).
+    pub struct_null_check_names: Vec<String>,
 }
 
 /// Helper to build a `FilterCandidate`.
@@ -212,14 +267,25 @@ impl FilterCandidateBuilder {
     /// * `Ok(None)` if the expression cannot be used as an ArrowFilter
     /// * `Err(e)` if an error occurs while building the candidate
     pub fn build(self, metadata: &ParquetMetaData) -> Result<Option<FilterCandidate>> {
-        let Some(required_column_indices) =
-            pushdown_columns(&self.expr, &self.file_schema)?
+        let Some(pushdown_result) = pushdown_columns(&self.expr, &self.file_schema)?
         else {
             return Ok(None);
         };
 
-        let projected_schema =
-            Arc::new(self.file_schema.project(&required_column_indices)?);
+        let required_column_indices = pushdown_result.required_columns;
+
+        // For struct null checks, build a schema with only the first field
+        // of each struct. The parquet reader will reconstruct the struct's
+        // null bitmap from any single leaf's definition levels.
+        let projected_schema = if pushdown_result.struct_null_checks.is_empty() {
+            Arc::new(self.file_schema.project(&required_column_indices)?)
+        } else {
+            Arc::new(build_struct_null_check_schema(
+                &self.file_schema,
+                &required_column_indices,
+                &pushdown_result.struct_null_checks,
+            ))
+        };
 
         let required_bytes = size_of_columns(&required_column_indices, metadata)?;
         let can_use_index = columns_sorted(&required_column_indices, metadata)?;
@@ -230,6 +296,11 @@ impl FilterCandidateBuilder {
             can_use_index,
             projection: required_column_indices,
             filter_schema: projected_schema,
+            struct_null_check_names: pushdown_result
+                .struct_null_checks
+                .iter()
+                .map(|&idx| self.file_schema.field(idx).name().to_string())
+                .collect(),
         }))
     }
 }
@@ -247,6 +318,11 @@ pub struct PushdownChecker<'schema> {
     projected_columns: bool,
     /// Indices into the file schema of columns required to evaluate the expression.
     required_columns: BTreeSet<usize>,
+    /// Indices of struct columns that only need a null check (IS NULL / IS NOT NULL).
+    /// These are allowed through pushdown even though they're nested types,
+    /// because the struct's null bitmap can be reconstructed from any single
+    /// leaf column's definition levels.
+    struct_null_checks: Vec<usize>,
     /// The Arrow schema of the parquet file.
     file_schema: &'schema Schema,
 }
@@ -257,6 +333,7 @@ impl<'schema> PushdownChecker<'schema> {
             non_primitive_columns: false,
             projected_columns: false,
             required_columns: BTreeSet::default(),
+            struct_null_checks: Vec::new(),
             file_schema,
         }
     }
@@ -277,6 +354,37 @@ impl<'schema> PushdownChecker<'schema> {
         None
     }
 
+    /// Detect `IS NOT NULL(Column(struct))` or `IS NULL(Column(struct))`.
+    /// If matched, record the struct root index and return Jump to prevent
+    /// the Column node from being visited (which would trigger blanket rejection).
+    fn try_handle_struct_null_check(
+        &mut self,
+        node: &Arc<dyn PhysicalExpr>,
+    ) -> Option<TreeNodeRecursion> {
+        // Extract the inner Column from IsNotNull or IsNull
+        let inner = if let Some(expr) = node.as_any().downcast_ref::<IsNotNullExpr>() {
+            Some(expr.arg())
+        } else if let Some(expr) = node.as_any().downcast_ref::<IsNullExpr>() {
+            Some(expr.arg())
+        } else {
+            None
+        }?;
+
+        let column = inner.as_any().downcast_ref::<Column>()?;
+        let idx = self.file_schema.index_of(column.name()).ok()?;
+
+        // Only handle struct columns — other nested types (list, map) are not supported
+        if !matches!(self.file_schema.field(idx).data_type(), DataType::Struct(_)) {
+            return None;
+        }
+
+        // Record as a struct null check — the struct root index is needed for
+        // projection but does NOT set non_primitive_columns
+        self.required_columns.insert(idx);
+        self.struct_null_checks.push(idx);
+        Some(TreeNodeRecursion::Jump)
+    }
+
     #[inline]
     fn prevents_pushdown(&self) -> bool {
         self.non_primitive_columns || self.projected_columns
@@ -287,6 +395,12 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
     type Node = Arc<dyn PhysicalExpr>;
 
     fn f_down(&mut self, node: &Self::Node) -> Result<TreeNodeRecursion> {
+        // Intercept IS NOT NULL / IS NULL on struct columns BEFORE the Column
+        // node is visited, to prevent the blanket nested-type rejection.
+        if let Some(recursion) = self.try_handle_struct_null_check(node) {
+            return Ok(recursion);
+        }
+
         if let Some(column) = node.as_any().downcast_ref::<Column>()
             && let Some(recursion) = self.check_single_column(column.name())
         {
@@ -297,22 +411,29 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
     }
 }
 
+/// Result of checking which columns an expression needs for pushdown.
+struct PushdownResult {
+    /// Arrow schema indices of columns needed to evaluate the expression.
+    required_columns: Vec<usize>,
+    /// Struct root indices that only need a null check (IS NULL / IS NOT NULL).
+    /// These need only their first parquet leaf for the definition levels.
+    struct_null_checks: Vec<usize>,
+}
+
 /// Checks if a given expression can be pushed down to the parquet decoder.
 ///
-/// Returns `Some(column_indices)` if the expression can be pushed down,
-/// where `column_indices` are the indices into the file schema of all columns
-/// required to evaluate the expression.
-///
-/// Returns `None` if the expression cannot be pushed down (e.g., references
-/// non-primitive types or columns not in the file).
+/// Returns `Some(PushdownResult)` if the expression can be pushed down.
+/// Returns `None` if the expression cannot be pushed down.
 fn pushdown_columns(
     expr: &Arc<dyn PhysicalExpr>,
     file_schema: &Schema,
-) -> Result<Option<Vec<usize>>> {
+) -> Result<Option<PushdownResult>> {
     let mut checker = PushdownChecker::new(file_schema);
     expr.visit(&mut checker)?;
-    Ok((!checker.prevents_pushdown())
-        .then_some(checker.required_columns.into_iter().collect()))
+    Ok((!checker.prevents_pushdown()).then_some(PushdownResult {
+        required_columns: checker.required_columns.into_iter().collect(),
+        struct_null_checks: checker.struct_null_checks,
+    }))
 }
 
 /// Checks if a predicate expression can be pushed down to the parquet decoder.
@@ -329,10 +450,46 @@ pub fn can_expr_be_pushed_down_with_schemas(
     expr: &Arc<dyn PhysicalExpr>,
     file_schema: &Schema,
 ) -> bool {
-    match pushdown_columns(expr, file_schema) {
-        Ok(Some(_)) => true,
-        Ok(None) | Err(_) => false,
-    }
+    matches!(pushdown_columns(expr, file_schema), Ok(Some(_)))
+}
+
+/// Build a projected schema for expressions containing struct null checks.
+///
+/// For struct columns that only need a null check, the schema includes only
+/// the first field of the struct. This is sufficient because the parquet reader
+/// reconstructs the struct's null bitmap from any single leaf's definition levels.
+///
+/// For non-struct columns, the full field is included as-is.
+fn build_struct_null_check_schema(
+    file_schema: &Schema,
+    required_column_indices: &[usize],
+    struct_null_checks: &[usize],
+) -> Schema {
+    use arrow::datatypes::Field;
+
+    let fields: Vec<Arc<Field>> = required_column_indices
+        .iter()
+        .map(|&idx| {
+            let field = file_schema.field(idx);
+            if struct_null_checks.contains(&idx) {
+                // Prune to only the first field of the struct
+                if let DataType::Struct(fields) = field.data_type() {
+                    if let Some(first_field) = fields.first() {
+                        let pruned_type =
+                            DataType::Struct(vec![Arc::clone(first_field)].into());
+                        return Arc::new(Field::new(
+                            field.name(),
+                            pruned_type,
+                            field.is_nullable(),
+                        ));
+                    }
+                }
+            }
+            Arc::new(field.clone())
+        })
+        .collect();
+
+    Schema::new_with_metadata(fields, file_schema.metadata().clone())
 }
 
 /// Calculate the total compressed size of all `Column`'s required for

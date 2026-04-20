@@ -559,8 +559,6 @@ impl FileOpener for ParquetOpener {
             );
 
             builder = builder.with_e6_context(e6_ctx);
-            let indices = projection.column_indices();
-
             let mask = build_projection_mask(
                 &projection,
                 &physical_file_schema,
@@ -596,38 +594,88 @@ impl FileOpener for ParquetOpener {
                             };
                         }
                         FilterEvaluationStrategy::E6 => {
-                            let candidate = FilterCandidateBuilder::new(
+                            if let Some(candidate) = FilterCandidateBuilder::new(
                                 Arc::clone(&predicate),
                                 Arc::clone(&physical_file_schema),
-                                // Arc::clone(&predicate_file_schema),
-                                // Arc::clone(&schema_adapter_factory),
                             )
                             .build(builder.metadata())?
-                            .unwrap();
+                            {
+                                let schema_descr =
+                                    builder.metadata().file_metadata().schema_descr();
+                                let mask = if candidate.struct_null_check_names.is_empty()
+                                {
+                                    ProjectionMask::roots(
+                                        schema_descr,
+                                        candidate.projection,
+                                    )
+                                } else {
+                                    // For struct null checks, read only the first
+                                    // leaf of each struct — its definition levels
+                                    // encode the struct's null bitmap.
+                                    let struct_null_set: std::collections::HashSet<&str> =
+                                        candidate
+                                            .struct_null_check_names
+                                            .iter()
+                                            .map(|s| s.as_str())
+                                            .collect();
 
-                            let mask = ProjectionMask::roots(
-                                builder.metadata().file_metadata().schema_descr(),
-                                candidate.projection,
-                            );
+                                    let mut leaf_indices: Vec<usize> = Vec::new();
+                                    for &root_idx in &candidate.projection {
+                                        let root_mask = ProjectionMask::roots(
+                                            schema_descr,
+                                            [root_idx],
+                                        );
+                                        let first_leaf = (0..schema_descr.num_columns())
+                                            .find(|&i| root_mask.leaf_included(i));
+                                        let is_struct_null =
+                                            first_leaf.is_some_and(|i| {
+                                                schema_descr
+                                                    .column(i)
+                                                    .path()
+                                                    .parts()
+                                                    .first()
+                                                    .is_some_and(|p| {
+                                                        struct_null_set
+                                                            .contains(p.as_str())
+                                                    })
+                                            });
 
-                            let physical_expr = reassign_expr_columns(
-                                candidate.expr,
-                                &candidate.filter_schema,
-                            )?;
+                                        if is_struct_null {
+                                            if let Some(leaf) = first_leaf {
+                                                leaf_indices.push(leaf);
+                                            }
+                                        } else {
+                                            for i in 0..schema_descr.num_columns() {
+                                                if root_mask.leaf_included(i) {
+                                                    leaf_indices.push(i);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    leaf_indices.sort_unstable();
+                                    leaf_indices.dedup();
+                                    ProjectionMask::leaves(schema_descr, leaf_indices)
+                                };
 
-                            let row_filter = RowFilter::new(vec![Box::new(
-                                ArrowPredicateFn::new(mask, move |batch| {
-                                    // let batch =
-                                    //     candidate.schema_mapper.map_batch(batch)?;
+                                let physical_expr = reassign_expr_columns(
+                                    candidate.expr,
+                                    &candidate.filter_schema,
+                                )?;
 
-                                    let batch_size = batch.num_rows();
+                                let row_filter = RowFilter::new(vec![Box::new(
+                                    ArrowPredicateFn::new(mask, move |batch| {
+                                        // let batch =
+                                        //     candidate.schema_mapper.map_batch(batch)?;
 
-                                    let columnar_value =
-                                        physical_expr.evaluate(&batch).map_err(|e| {
-                                            ArrowError::ExternalError(Box::new(e))
-                                        })?;
+                                        let batch_size = batch.num_rows();
 
-                                    let bool_arr = match columnar_value {
+                                        let columnar_value = physical_expr
+                                            .evaluate(&batch)
+                                            .map_err(|e| {
+                                                ArrowError::ExternalError(Box::new(e))
+                                            })?;
+
+                                        let bool_arr = match columnar_value {
                                         ColumnarValue::Array(array) => array
                                             .as_any()
                                             .downcast_ref::<BooleanArray>()
@@ -659,11 +707,15 @@ impl FileOpener for ParquetOpener {
                                         }
                                     };
 
-                                    Ok(bool_arr)
-                                }),
-                            )]);
+                                        Ok(bool_arr)
+                                    }),
+                                )]);
 
-                            builder = builder.with_row_filter(row_filter);
+                                builder = builder.with_row_filter(row_filter);
+
+                                // Record struct null check names so we can exclude
+                                // them from the main projection mask below.
+                            } // if let Some(candidate)
                         }
                     }
                 } else {
