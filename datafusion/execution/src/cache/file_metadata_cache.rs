@@ -246,6 +246,15 @@ impl FileMetadataCache for DefaultFilesMetadataCache {
 
         entries
     }
+
+    fn memory_limit(&self) -> usize {
+        let state = self.state.lock().unwrap();
+        state.memory_limit
+    }
+
+    fn memory_used(&self) -> usize {
+        self.memory_used()
+    }
 }
 
 impl CacheAccessor<ObjectMeta, Arc<dyn FileMetadata>> for DefaultFilesMetadataCache {

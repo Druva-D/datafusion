@@ -158,6 +158,16 @@ pub trait FileMetadataCache:
     fn miss_count(&self) -> usize {
         0
     }
+
+    /// Returns max memory usage allowed for the cache
+    fn memory_limit(&self) -> usize {
+        0
+    }
+
+    /// Returns memory currently in use by the cache
+    fn memory_used(&self) -> usize {
+        0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
