@@ -56,21 +56,24 @@ use arrow::buffer::BooleanBuffer;
 use arrow::compute::{
     BatchCoalescer, concat_batches, filter, filter_record_batch, not, take,
 };
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::DataType;
 use datafusion_common::cast::as_boolean_array;
-use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{
     JoinSide, Result, ScalarValue, Statistics, arrow_err, assert_eq_or_internal_err,
     internal_datafusion_err, internal_err, project_schema, unwrap_or_internal_err,
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_expr::ColumnarValue;
 use datafusion_expr::JoinType;
 use datafusion_physical_expr::equivalence::{
     ProjectionMapping, join_equivalence_properties,
 };
+use datafusion_physical_expr::expressions::Column as PhysicalColumn;
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
 use datafusion_physical_expr::projection::{ProjectionRef, combine_projections};
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -555,7 +558,7 @@ impl ExecutionPlan for NestedLoopJoinExec {
 
     fn apply_expressions(
         &self,
-        f: &mut dyn FnMut(&dyn crate::PhysicalExpr) -> Result<TreeNodeRecursion>,
+        f: &mut dyn FnMut(&dyn PhysicalExpr) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
         // Apply to join filter expressions if present
         if let Some(filter) = &self.filter {
@@ -869,6 +872,11 @@ pub(crate) struct NestedLoopJoinStream {
     /// See comments in [`need_produce_right_in_final`] for more detail
     should_track_unmatched_right: bool,
 
+    /// Pre-computed scalar-aware filter for efficient single-row evaluation.
+    /// When present, build-side columns are evaluated as scalars instead of
+    /// being broadcast into full arrays.
+    scalar_filter: Option<ScalarAwareFilter>,
+
     // ========================================================================
     // STATE FLAGS/BUFFERS:
     // Fields that hold intermediate data/flags during execution
@@ -1133,6 +1141,10 @@ impl NestedLoopJoinStream {
         metrics: NestedLoopJoinMetrics,
         batch_size: usize,
     ) -> Self {
+        let scalar_filter = filter
+            .as_ref()
+            .and_then(|f| build_scalar_aware_filter(f, JoinSide::Left).ok().flatten());
+
         Self {
             output_schema: Arc::clone(&schema),
             join_filter: filter,
@@ -1153,6 +1165,7 @@ impl NestedLoopJoinStream {
             left_buffered_in_one_pass: true,
             handled_empty_output: false,
             should_track_unmatched_right: need_produce_right_in_final(join_type),
+            scalar_filter,
         }
     }
 
@@ -1641,12 +1654,16 @@ impl NestedLoopJoinStream {
         }
 
         let cur_right_bitmap = if let Some(filter) = &self.join_filter {
-            apply_filter_to_row_join_batch(
-                left_data.batch(),
-                l_index,
-                right_batch,
-                filter,
-            )?
+            if let Some(sf) = &self.scalar_filter {
+                evaluate_filter_scalar_aware(sf, left_data.batch(), l_index, right_batch)?
+            } else {
+                apply_filter_to_row_join_batch(
+                    left_data.batch(),
+                    l_index,
+                    right_batch,
+                    filter,
+                )?
+            }
         } else {
             BooleanArray::from(vec![true; right_row_count])
         };
@@ -2320,6 +2337,246 @@ fn build_unmatched_batch(
     }
 }
 
+// ==== Scalar-Aware Filter Optimization ====
+//
+// When evaluating a NLJ filter for a single build-side row against a probe batch,
+// the original path broadcasts build-side scalars into full N-element arrays via
+// `ScalarValue::to_array_of_size()`, then does array-vs-array comparison. This is
+// expensive for string/binary types and misses Arrow's optimized scalar-vs-array
+// comparison kernels.
+//
+// The scalar-aware filter rewrites the expression tree once at stream initialization,
+// replacing build-side `Column` nodes with `ScalarColumnExpr` placeholders that
+// return `ColumnarValue::Scalar`. This lets downstream `BinaryExpr::evaluate` hit
+// Arrow's native scalar-vs-array comparison path.
+
+/// A `PhysicalExpr` placeholder that holds a mutable scalar value.
+///
+/// On each build row, the scalar is updated via the shared `Mutex` handle,
+/// then `evaluate` returns `ColumnarValue::Scalar(value)`. This allows
+/// downstream `BinaryExpr::evaluate` to use Arrow's optimized scalar-vs-array
+/// comparison kernels instead of broadcasting the scalar into a full array.
+#[derive(Debug)]
+struct ScalarColumnExpr {
+    name: String,
+    data_type: DataType,
+    value: Arc<Mutex<ScalarValue>>,
+}
+
+impl ScalarColumnExpr {
+    fn new(name: String, data_type: DataType) -> Self {
+        let initial = ScalarValue::try_from(&data_type).unwrap_or(ScalarValue::Null);
+        Self {
+            name,
+            data_type,
+            value: Arc::new(Mutex::new(initial)),
+        }
+    }
+
+    fn value_handle(&self) -> Arc<Mutex<ScalarValue>> {
+        Arc::clone(&self.value)
+    }
+}
+
+impl std::fmt::Display for ScalarColumnExpr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ScalarColumn({})", self.name)
+    }
+}
+
+// Use pointer identity for PartialEq/Hash since each ScalarColumnExpr is a
+// unique placeholder. This satisfies the DynEq/DynHash bounds on PhysicalExpr.
+impl PartialEq for ScalarColumnExpr {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.value, &other.value)
+    }
+}
+
+impl Eq for ScalarColumnExpr {}
+
+impl std::hash::Hash for ScalarColumnExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.value).hash(state);
+    }
+}
+
+impl PhysicalExpr for ScalarColumnExpr {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn data_type(&self, _input_schema: &Schema) -> Result<DataType> {
+        Ok(self.data_type.clone())
+    }
+
+    fn nullable(&self, _input_schema: &Schema) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn evaluate(&self, _batch: &RecordBatch) -> Result<ColumnarValue> {
+        let val = self.value.lock().clone();
+        Ok(ColumnarValue::Scalar(val))
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        Ok(self)
+    }
+
+    fn fmt_sql(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
+
+/// Pre-computed rewrite result for scalar-aware filter evaluation.
+struct ScalarAwareFilter {
+    /// The rewritten filter expression with ScalarColumnExpr nodes for build-side columns
+    expression: Arc<dyn PhysicalExpr>,
+    /// Handles to update scalar values per build row: (build_batch_col_index, mutex_handle)
+    scalar_slots: Vec<(usize, Arc<Mutex<ScalarValue>>)>,
+    /// Schema for the probe-only RecordBatch
+    probe_schema: SchemaRef,
+    /// Maps filter column positions to probe batch column indices:
+    /// (filter_col_position, probe_batch_col_index)
+    probe_column_map: Vec<(usize, usize)>,
+}
+
+/// Build a scalar-aware filter by rewriting the expression tree once at
+/// stream initialization.
+///
+/// Build-side `Column` references are replaced with `ScalarColumnExpr`
+/// placeholders. Probe-side `Column` references are remapped to a
+/// probe-only schema.
+///
+/// Returns `Ok(None)` if there are no build-side columns (optimization
+/// not applicable).
+fn build_scalar_aware_filter(
+    filter: &JoinFilter,
+    build_side: JoinSide,
+) -> Result<Option<ScalarAwareFilter>> {
+    let col_indices = &filter.column_indices;
+    let filter_schema = &filter.schema;
+
+    // Partition columns into build-side and probe-side
+    let mut build_positions: Vec<usize> = Vec::new();
+    let mut probe_positions: Vec<usize> = Vec::new();
+    for (pos, ci) in col_indices.iter().enumerate() {
+        if ci.side == build_side {
+            build_positions.push(pos);
+        } else {
+            probe_positions.push(pos);
+        }
+    }
+
+    // Early return if no build-side columns — optimization not applicable
+    if build_positions.is_empty() {
+        return Ok(None);
+    }
+
+    // Create ScalarColumnExpr for each build-side column
+    let mut scalar_slots: Vec<(usize, Arc<Mutex<ScalarValue>>)> = Vec::new();
+    let mut build_replacements: Vec<(usize, Arc<dyn PhysicalExpr>)> = Vec::new();
+    for &pos in &build_positions {
+        let field = filter_schema.field(pos);
+        let scalar_col =
+            ScalarColumnExpr::new(field.name().clone(), field.data_type().clone());
+        let handle = scalar_col.value_handle();
+        scalar_slots.push((col_indices[pos].index, handle));
+        build_replacements.push((pos, Arc::new(scalar_col) as Arc<dyn PhysicalExpr>));
+    }
+
+    // Build probe-only schema and column index remapping
+    let mut probe_fields: Vec<Field> = Vec::new();
+    let mut probe_column_map: Vec<(usize, usize)> = Vec::new();
+    for (new_idx, &pos) in probe_positions.iter().enumerate() {
+        let field = filter_schema.field(pos);
+        probe_fields.push(field.as_ref().clone());
+        probe_column_map.push((pos, col_indices[pos].index));
+        // We'll remap Column(pos) -> Column(new_idx) below
+        let _ = new_idx; // used in the closure
+    }
+    let probe_schema = Arc::new(Schema::new(probe_fields));
+
+    // Build lookup maps for the rewrite
+    let mut build_map: std::collections::HashMap<usize, Arc<dyn PhysicalExpr>> =
+        std::collections::HashMap::new();
+    for (pos, replacement) in build_replacements {
+        build_map.insert(pos, replacement);
+    }
+
+    let mut probe_remap: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    for (new_idx, &pos) in probe_positions.iter().enumerate() {
+        probe_remap.insert(pos, new_idx);
+    }
+
+    // Rewrite expression tree: replace Column nodes
+    let rewritten = Arc::clone(filter.expression()).transform_up(|expr| {
+        if let Some(col) = expr.as_any().downcast_ref::<PhysicalColumn>() {
+            let idx = col.index();
+            if let Some(replacement) = build_map.get(&idx) {
+                return Ok(Transformed::yes(Arc::clone(replacement)));
+            }
+            if let Some(&new_idx) = probe_remap.get(&idx) {
+                let new_col = PhysicalColumn::new(col.name(), new_idx);
+                return Ok(Transformed::yes(Arc::new(new_col) as Arc<dyn PhysicalExpr>));
+            }
+        }
+        Ok(Transformed::no(expr))
+    })?;
+
+    Ok(Some(ScalarAwareFilter {
+        expression: rewritten.data,
+        scalar_slots,
+        probe_schema,
+        probe_column_map,
+    }))
+}
+
+/// Evaluate the join filter using the scalar-aware path.
+///
+/// For each build-side column, extracts a `ScalarValue` from the build batch
+/// and updates the corresponding `ScalarColumnExpr` placeholder. Then evaluates
+/// the rewritten expression against a probe-only batch.
+fn evaluate_filter_scalar_aware(
+    sf: &ScalarAwareFilter,
+    build_batch: &RecordBatch,
+    build_idx: usize,
+    probe_batch: &RecordBatch,
+) -> Result<BooleanArray> {
+    // Update scalar slots with values from the current build row
+    for (col_idx, handle) in &sf.scalar_slots {
+        let array = build_batch.column(*col_idx);
+        let scalar = ScalarValue::try_from_array(array.as_ref(), build_idx)?;
+        *handle.lock() = scalar;
+    }
+
+    // Build probe-only batch (zero-copy: just Arc::clone of existing arrays)
+    let probe_columns: Vec<Arc<dyn Array>> = sf
+        .probe_column_map
+        .iter()
+        .map(|&(_, probe_col_idx)| Arc::clone(probe_batch.column(probe_col_idx)))
+        .collect();
+
+    let probe_only_batch =
+        RecordBatch::try_new(Arc::clone(&sf.probe_schema), probe_columns)?;
+
+    // Evaluate the rewritten expression
+    let filter_result = sf
+        .expression
+        .evaluate(&probe_only_batch)?
+        .into_array(probe_only_batch.num_rows())?;
+    let filter_arr = as_boolean_array(&filter_result)?;
+
+    Ok(boolean_mask_from_filter(filter_arr))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2905,5 +3162,267 @@ pub(crate) mod tests {
     /// Returns the column names on the schema
     fn columns(schema: &Schema) -> Vec<String> {
         schema.fields().iter().map(|f| f.name().clone()).collect()
+    }
+
+    // ==== Scalar-Aware Filter Tests ====
+
+    #[test]
+    fn scalar_aware_filter_build_with_build_side_columns() {
+        // Filter: left.b1 != right.b2 (both build and probe columns present)
+        let filter = prepare_join_filter();
+        let result = build_scalar_aware_filter(&filter, JoinSide::Left).unwrap();
+        assert!(
+            result.is_some(),
+            "Should produce a scalar-aware filter when build-side columns exist"
+        );
+        let sf = result.unwrap();
+        assert_eq!(sf.scalar_slots.len(), 1, "One build-side column");
+        assert_eq!(sf.probe_column_map.len(), 1, "One probe-side column");
+        assert_eq!(
+            sf.probe_schema.fields().len(),
+            1,
+            "Probe-only schema has 1 field"
+        );
+    }
+
+    #[test]
+    fn scalar_aware_filter_returns_none_when_no_build_columns() {
+        // Filter with only probe-side columns
+        let column_indices = vec![ColumnIndex {
+            index: 0,
+            side: JoinSide::Right,
+        }];
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, true)]);
+        let expression = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("x", 0)),
+            Operator::Gt,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(5)))),
+        )) as Arc<dyn PhysicalExpr>;
+        let filter = JoinFilter::new(expression, column_indices, Arc::new(schema));
+        let result = build_scalar_aware_filter(&filter, JoinSide::Left).unwrap();
+        assert!(
+            result.is_none(),
+            "Should return None when no build-side columns"
+        );
+    }
+
+    #[test]
+    fn scalar_aware_filter_produces_same_results_as_original() {
+        // Build left batch: b1 = [5, 8, 8]
+        let left_batch = build_table_i32(
+            ("a1", &vec![5, 9, 11]),
+            ("b1", &vec![5, 8, 8]),
+            ("c1", &vec![50, 90, 110]),
+        );
+        // Build right batch: b2 = [10, 2, 10]
+        let right_batch = build_table_i32(
+            ("a2", &vec![12, 2, 10]),
+            ("b2", &vec![10, 2, 10]),
+            ("c2", &vec![40, 80, 100]),
+        );
+        let filter = prepare_join_filter();
+        let sf = build_scalar_aware_filter(&filter, JoinSide::Left)
+            .unwrap()
+            .unwrap();
+
+        // Test each left row against the right batch
+        for l_idx in 0..left_batch.num_rows() {
+            let original =
+                apply_filter_to_row_join_batch(&left_batch, l_idx, &right_batch, &filter)
+                    .unwrap();
+            let scalar_aware =
+                evaluate_filter_scalar_aware(&sf, &left_batch, l_idx, &right_batch)
+                    .unwrap();
+            assert_eq!(
+                original, scalar_aware,
+                "Results differ for left row {l_idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_aware_filter_handles_nulls() {
+        // Left batch with nulls
+        let left_a =
+            Arc::new(arrow::array::Int32Array::from(vec![Some(1), None, Some(3)]));
+        let left_schema =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let left_batch = RecordBatch::try_new(left_schema, vec![left_a]).unwrap();
+
+        // Right batch
+        let right_b = Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3, 4]));
+        let right_schema =
+            Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, true)]));
+        let right_batch = RecordBatch::try_new(right_schema, vec![right_b]).unwrap();
+
+        // Filter: left.a < right.b
+        let column_indices = vec![
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Right,
+            },
+        ];
+        let filter_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        let expression = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("a", 0)),
+            Operator::Lt,
+            Arc::new(Column::new("b", 1)),
+        )) as Arc<dyn PhysicalExpr>;
+        let filter = JoinFilter::new(expression, column_indices, Arc::new(filter_schema));
+        let sf = build_scalar_aware_filter(&filter, JoinSide::Left)
+            .unwrap()
+            .unwrap();
+
+        for l_idx in 0..left_batch.num_rows() {
+            let original =
+                apply_filter_to_row_join_batch(&left_batch, l_idx, &right_batch, &filter)
+                    .unwrap();
+            let scalar_aware =
+                evaluate_filter_scalar_aware(&sf, &left_batch, l_idx, &right_batch)
+                    .unwrap();
+            assert_eq!(
+                original, scalar_aware,
+                "Null handling differs for left row {l_idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_aware_filter_with_string_columns() {
+        // This is the key performance scenario — string broadcast is expensive
+        let left_vals = Arc::new(arrow::array::StringArray::from(vec![
+            "hello", "world", "test",
+        ]));
+        let left_schema =
+            Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let left_batch = RecordBatch::try_new(left_schema, vec![left_vals]).unwrap();
+
+        let right_vals = Arc::new(arrow::array::StringArray::from(vec![
+            "apple", "hello", "test", "world", "zebra",
+        ]));
+        let right_schema =
+            Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, false)]));
+        let right_batch = RecordBatch::try_new(right_schema, vec![right_vals]).unwrap();
+
+        // Filter: left.s = right.t
+        let column_indices = vec![
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Right,
+            },
+        ];
+        let filter_schema = Schema::new(vec![
+            Field::new("s", DataType::Utf8, false),
+            Field::new("t", DataType::Utf8, false),
+        ]);
+        let expression = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("s", 0)),
+            Operator::Eq,
+            Arc::new(Column::new("t", 1)),
+        )) as Arc<dyn PhysicalExpr>;
+        let filter = JoinFilter::new(expression, column_indices, Arc::new(filter_schema));
+        let sf = build_scalar_aware_filter(&filter, JoinSide::Left)
+            .unwrap()
+            .unwrap();
+
+        for l_idx in 0..left_batch.num_rows() {
+            let original =
+                apply_filter_to_row_join_batch(&left_batch, l_idx, &right_batch, &filter)
+                    .unwrap();
+            let scalar_aware =
+                evaluate_filter_scalar_aware(&sf, &left_batch, l_idx, &right_batch)
+                    .unwrap();
+            assert_eq!(
+                original, scalar_aware,
+                "String comparison differs for left row {l_idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_aware_filter_multi_build_columns() {
+        // Filter with multiple build-side columns: left.a > right.x AND left.b < right.y
+        let left_batch = build_table_i32(
+            ("a", &vec![1, 5, 10]),
+            ("b", &vec![100, 50, 10]),
+            ("c", &vec![0, 0, 0]),
+        );
+        let right_batch = build_table_i32(
+            ("x", &vec![3, 7, 2]),
+            ("y", &vec![60, 20, 200]),
+            ("z", &vec![0, 0, 0]),
+        );
+
+        let column_indices = vec![
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Right,
+            },
+            ColumnIndex {
+                index: 1,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 1,
+                side: JoinSide::Right,
+            },
+        ];
+        let filter_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("x", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+            Field::new("y", DataType::Int32, true),
+        ]);
+        // left.a > right.x
+        let cond1 = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("a", 0)),
+            Operator::Gt,
+            Arc::new(Column::new("x", 1)),
+        )) as Arc<dyn PhysicalExpr>;
+        // left.b < right.y
+        let cond2 = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("b", 2)),
+            Operator::Lt,
+            Arc::new(Column::new("y", 3)),
+        )) as Arc<dyn PhysicalExpr>;
+        // AND
+        let expression = Arc::new(BinaryExpr::new(cond1, Operator::And, cond2))
+            as Arc<dyn PhysicalExpr>;
+
+        let filter = JoinFilter::new(expression, column_indices, Arc::new(filter_schema));
+        let sf = build_scalar_aware_filter(&filter, JoinSide::Left)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(sf.scalar_slots.len(), 2, "Two build-side columns");
+        assert_eq!(sf.probe_column_map.len(), 2, "Two probe-side columns");
+
+        for l_idx in 0..left_batch.num_rows() {
+            let original =
+                apply_filter_to_row_join_batch(&left_batch, l_idx, &right_batch, &filter)
+                    .unwrap();
+            let scalar_aware =
+                evaluate_filter_scalar_aware(&sf, &left_batch, l_idx, &right_batch)
+                    .unwrap();
+            assert_eq!(
+                original, scalar_aware,
+                "Multi-column filter differs for left row {l_idx}"
+            );
+        }
     }
 }
