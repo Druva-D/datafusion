@@ -1496,6 +1496,7 @@ impl Expr {
         match self {
             Expr::Column(_) => ExpressionPlacement::Column,
             Expr::Literal(_, _) => ExpressionPlacement::Literal,
+            Expr::Alias(inner) => inner.expr.placement(),
             Expr::ScalarFunction(func) => {
                 let arg_placements: Vec<_> =
                     func.args.iter().map(|arg| arg.placement()).collect();

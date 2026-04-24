@@ -33,11 +33,14 @@ use arrow::error::ArrowError;
 use datafusion_common::config::{ConfigOptions, FilterEvaluationStrategy};
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_expr::ColumnarValue;
+use datafusion_physical_expr::ScalarFunctionExpr;
+use datafusion_physical_expr::expressions::{CastColumnExpr, Column, Literal};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
 use parquet::arrow::e6_context::E6Context;
-use std::collections::HashMap;
+use parquet::schema::types::SchemaDescriptor;
+use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -556,16 +559,19 @@ impl FileOpener for ParquetOpener {
             );
 
             builder = builder.with_e6_context(e6_ctx);
-
             let indices = projection.column_indices();
-            let mask = ProjectionMask::roots(builder.parquet_schema(), indices);
+
+            let mask = build_projection_mask(
+                &projection,
+                &physical_file_schema,
+                builder.parquet_schema(),
+            );
 
             // Filter pushdown: evaluate predicates during scan
             if let Some(mut predicate) = pushdown_filters.then_some(predicate).flatten() {
                 if is_dynamic_physical_expr(&predicate) {
                     predicate = snapshot_physical_expr_opt(Arc::clone(&predicate))?.data;
                 }
-                // println!("{:?}", predicate);
                 if let Some(cfg_opts) = cfg_opts_opt {
                     match cfg_opts.execution.filter_evaluation_strategy {
                         FilterEvaluationStrategy::Datafusion => {
@@ -1305,6 +1311,165 @@ fn should_enable_page_index(
             .as_ref()
             .map(|p| p.filter_number() > 0)
             .unwrap_or(false)
+}
+
+/// Build a [`ProjectionMask`] from projection expressions, using leaf-level
+/// indices when `get_field` accesses on struct columns are detected.
+///
+/// When all projection expressions are plain column references (or the schema
+/// has no struct columns), this falls back to `ProjectionMask::roots()`.
+/// Otherwise it resolves `get_field` chains to specific Parquet leaf columns
+/// so only the needed struct sub-fields are read.
+fn build_projection_mask(
+    projection: &ProjectionExprs,
+    file_schema: &arrow::datatypes::Schema,
+    parquet_schema: &SchemaDescriptor,
+) -> ProjectionMask {
+    let has_struct_columns = file_schema
+        .fields()
+        .iter()
+        .any(|f| matches!(f.data_type(), DataType::Struct(_)));
+
+    if !has_struct_columns {
+        // Fast path: no struct columns, root-level projection is sufficient
+        let indices = projection.column_indices();
+        return ProjectionMask::roots(parquet_schema, indices);
+    }
+
+    let mut leaf_indices = BTreeSet::new();
+    let mut found_get_field = false;
+
+    for proj_expr in projection.as_ref() {
+        for access in extract_column_accesses(&proj_expr.expr, file_schema) {
+            if access.field_path.is_empty() {
+                // Need all leaves under this root column
+                for leaf_idx in 0..parquet_schema.num_columns() {
+                    if parquet_schema.get_column_root_idx(leaf_idx) == access.root_index {
+                        leaf_indices.insert(leaf_idx);
+                    }
+                }
+            } else {
+                found_get_field = true;
+                let root_name = file_schema.field(access.root_index).name();
+                let prefix: Vec<&str> = std::iter::once(root_name.as_str())
+                    .chain(access.field_path.iter().map(|s| s.as_str()))
+                    .collect();
+
+                for (leaf_idx, col) in parquet_schema.columns().iter().enumerate() {
+                    let parts = col.path().parts();
+                    if parts.len() >= prefix.len() && parts[..prefix.len()] == prefix[..]
+                    {
+                        leaf_indices.insert(leaf_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    if !found_get_field {
+        // No struct field accesses found, fall back to root-level projection
+        let indices = projection.column_indices();
+        return ProjectionMask::roots(parquet_schema, indices);
+    }
+
+    ProjectionMask::leaves(parquet_schema, leaf_indices)
+}
+
+/// A column access extracted from a projection expression.
+struct ColumnAccess {
+    /// Root column index in the Arrow schema.
+    root_index: usize,
+    /// Nested field path (empty = entire column needed).
+    field_path: Vec<String>,
+}
+
+/// Unwrap a `Column` from either a direct `Column` or a `CastColumnExpr(Column)`.
+fn unwrap_to_column(expr: &Arc<dyn PhysicalExpr>) -> Option<&Column> {
+    if let Some(col) = expr.as_any().downcast_ref::<Column>() {
+        return Some(col);
+    }
+    if let Some(cast) = expr.as_any().downcast_ref::<CastColumnExpr>() {
+        return cast.expr().as_any().downcast_ref::<Column>();
+    }
+    None
+}
+
+/// Extract column access patterns from a physical expression.
+///
+/// Detects flattened `get_field(col, "f1", "f2", ...)` calls and records
+/// the specific nested field path for leaf-level parquet pruning.
+/// For bare `Column` references or `get_field` on non-struct types (e.g. Map),
+/// records an empty path meaning all leaves are needed.
+///
+/// Handles both `Column` and `CastColumnExpr(Column)` as the source of
+/// `get_field`, since projection pushdown composes with `CastColumnExpr`.
+fn extract_column_accesses(
+    expr: &Arc<dyn PhysicalExpr>,
+    file_schema: &arrow::datatypes::Schema,
+) -> Vec<ColumnAccess> {
+    // Check if this is a get_field call on a struct column
+    if let Some(func) = expr.as_any().downcast_ref::<ScalarFunctionExpr>() {
+        if func.name() == "get_field" {
+            let args = func.args();
+            if args.len() >= 2 {
+                let field_names: Vec<String> = args[1..]
+                    .iter()
+                    .filter_map(|arg| {
+                        arg.as_any()
+                            .downcast_ref::<Literal>()
+                            .and_then(|lit| lit.value().try_as_str())
+                            .and_then(|opt_s| opt_s.map(|s| s.to_string()))
+                    })
+                    .collect();
+
+                if field_names.len() == args.len() - 1 {
+                    let source = &args[0];
+                    if let Some(col) = unwrap_to_column(source) {
+                        // Only prune struct columns; Map get_field is a runtime
+                        // key lookup, not a schema-level field access.
+                        if matches!(
+                            file_schema.field(col.index()).data_type(),
+                            DataType::Struct(_)
+                        ) {
+                            return vec![ColumnAccess {
+                                root_index: col.index(),
+                                field_path: field_names,
+                            }];
+                        }
+                        // Map or other type: need all leaves
+                        return vec![ColumnAccess {
+                            root_index: col.index(),
+                            field_path: vec![],
+                        }];
+                    }
+                    // Source is not a Column or CastColumnExpr(Column).
+                    // Fallback: disable leaf pruning for safety.
+                    let inner = extract_column_accesses(source, file_schema);
+                    return inner
+                        .into_iter()
+                        .map(|mut access| {
+                            access.field_path.clear();
+                            access
+                        })
+                        .collect();
+                }
+            }
+        }
+    }
+
+    // Direct Column reference — needs all leaves under this root
+    if let Some(col) = expr.as_any().downcast_ref::<Column>() {
+        return vec![ColumnAccess {
+            root_index: col.index(),
+            field_path: vec![],
+        }];
+    }
+
+    // Recurse into children
+    expr.children()
+        .into_iter()
+        .flat_map(|child| extract_column_accesses(child, file_schema))
+        .collect()
 }
 
 #[cfg(test)]
