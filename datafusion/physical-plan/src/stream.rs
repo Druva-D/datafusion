@@ -38,7 +38,9 @@ use datafusion_execution::memory_pool::MemoryReservation;
 use futures::ready;
 use futures::stream::BoxStream;
 use futures::{Future, Stream, StreamExt};
+use log::Level;
 use log::debug;
+use log::log_enabled;
 use pin_project_lite::pin_project;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -346,6 +348,14 @@ impl RecordBatchReceiverStreamBuilder {
                 Ok(stream) => stream,
             };
 
+            let plan_display = if log_enabled!(Level::Debug) {
+                displayable(input.as_ref()).one_line().to_string()
+            } else {
+                "".to_owned()
+            };
+
+            drop(input);
+
             // Transfer batches from inner stream to the output tx
             // immediately.
             while let Some(item) = stream.next().await {
@@ -355,8 +365,7 @@ impl RecordBatchReceiverStreamBuilder {
                 // place to send the error and no reason to continue.
                 if output.send(item).await.is_err() {
                     debug!(
-                        "Stopping execution: output is gone, plan cancelling: {}",
-                        displayable(input.as_ref()).one_line()
+                        "Stopping execution: output is gone, plan cancelling: {plan_display}",
                     );
                     return Ok(());
                 }
@@ -365,8 +374,7 @@ impl RecordBatchReceiverStreamBuilder {
                 // drive all streams to completion)
                 if is_err {
                     debug!(
-                        "Stopping execution: plan returned error: {}",
-                        displayable(input.as_ref()).one_line()
+                        "Stopping execution: plan returned error: {plan_display}",
                     );
                     return Ok(());
                 }
