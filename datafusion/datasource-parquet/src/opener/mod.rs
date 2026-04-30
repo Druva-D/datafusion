@@ -36,7 +36,7 @@ use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
-use parquet::arrow::data_cache::DataCache;
+use parquet::arrow::e6_context::E6Context;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -134,8 +134,8 @@ pub(super) struct ParquetOpener {
     /// Optional parquet FileDecryptionProperties
     #[cfg(feature = "parquet_encryption")]
     pub file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
-    /// E6 data cache
-    pub data_cache_opt: Option<Arc<DataCache>>,
+    /// E6 context
+    pub e6_ctx: E6Context,
     /// Config options
     pub config_options_opt: Option<Arc<ConfigOptions>>,
     /// Rewrite expressions in the context of the file schema
@@ -335,7 +335,8 @@ impl FileOpener for ParquetOpener {
         let max_predicate_cache_size = self.max_predicate_cache_size;
 
         let reverse_row_groups = self.reverse_row_groups;
-        let data_cache_opt = self.data_cache_opt.clone();
+        let mut e6_ctx = self.e6_ctx.clone();
+        e6_ctx.parquet_file_path = file_name.clone();
         let cfg_opts_opt = self.config_options_opt.clone();
         Ok(Box::pin(async move {
             #[cfg(feature = "parquet_encryption")]
@@ -554,12 +555,9 @@ impl FileOpener for ParquetOpener {
                 reader_metadata,
             );
 
-            let indices = projection.column_indices();
-            if let Some(data_cache) = data_cache_opt {
-                builder = builder.with_parquet_file_path(file_name.clone());
-                builder = builder.with_data_cache(data_cache);
-            }
+            builder = builder.with_e6_context(e6_ctx);
 
+            let indices = projection.column_indices();
             let mask = ProjectionMask::roots(builder.parquet_schema(), indices);
 
             // Filter pushdown: evaluate predicates during scan
@@ -1492,7 +1490,7 @@ mod test {
                 encryption_factory: None,
                 max_predicate_cache_size: self.max_predicate_cache_size,
                 reverse_row_groups: self.reverse_row_groups,
-                data_cache_opt: None,
+                e6_ctx: E6Context::default(),
                 config_options_opt: None,
                 pruning_cache: Arc::new(Mutex::new(None)),
             }

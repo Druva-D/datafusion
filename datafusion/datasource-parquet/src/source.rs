@@ -53,16 +53,16 @@ use datafusion_physical_plan::filter_pushdown::{
 use datafusion_physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricType,
 };
+use parquet::arrow::e6_context::E6Context;
 
 #[cfg(feature = "parquet_encryption")]
 use datafusion_execution::parquet_encryption::EncryptionFactory;
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 use itertools::Itertools;
 use object_store::ObjectStore;
+
 #[cfg(feature = "parquet_encryption")]
 use parquet::encryption::decrypt::FileDecryptionProperties;
-
-use parquet::arrow::data_cache::DataCache;
 
 /// Execution plan for reading one or more Parquet files.
 ///
@@ -290,8 +290,8 @@ pub struct ParquetSource {
     pub(crate) metadata_size_hint: Option<usize>,
     /// Projection to apply to the output.
     pub(crate) projection: ProjectionExprs,
-    /// E6 Data cache
-    pub(crate) data_cache_opt: Option<Arc<DataCache>>,
+    /// E6 Context
+    pub(crate) e6_ctx: E6Context,
     /// Config options
     pub(crate) config_options_opt: Option<Arc<ConfigOptions>>,
     #[cfg(feature = "parquet_encryption")]
@@ -333,10 +333,10 @@ impl ParquetSource {
             parquet_file_reader_factory: None,
             batch_size: None,
             metadata_size_hint: None,
+            e6_ctx: E6Context::default(),
             #[cfg(feature = "parquet_encryption")]
             encryption_factory: None,
             reverse_row_groups: false,
-            data_cache_opt: None,
             config_options_opt: None,
             file_metadata_cache: None,
             hits_at_construction: 0,
@@ -616,7 +616,7 @@ impl FileSource for ParquetSource {
             #[cfg(feature = "parquet_encryption")]
             file_decryption_properties,
             expr_adapter_factory,
-            data_cache_opt: self.data_cache_opt.clone(),
+            e6_ctx: self.e6_ctx.clone(),
             config_options_opt: self.config_options_opt.clone(),
             #[cfg(feature = "parquet_encryption")]
             encryption_factory: self.get_encryption_factory_with_config(),
@@ -886,8 +886,8 @@ impl FileSource for ParquetSource {
 }
 
 impl ParquetSource {
-    pub fn with_data_cache(&mut self, data_cache: Arc<DataCache>) {
-        self.data_cache_opt = Some(data_cache);
+    pub fn with_e6_context(&mut self, ctx: E6Context) {
+        self.e6_ctx = ctx;
     }
 
     pub fn with_config_options(&mut self, cfg_opts: Arc<ConfigOptions>) {
